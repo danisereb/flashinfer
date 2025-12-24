@@ -1383,11 +1383,8 @@ def execute_cudnn_gemm_mxfp8_graph(
         UIDs.O_UID.value: c_final,
     }
 
-    # Get workspace size for the specific plan if tactic is specified
-    if tactic == -1:
-        workspace_size = graph.get_workspace_size()
-    else:
-        workspace_size = graph.get_workspace_size(tactic)
+    # Get workspace size - cuDNN get_workspace_size() doesn't take tactic argument
+    workspace_size = graph.get_workspace_size()
 
     if workspace_buffer.numel() < workspace_size:
         workspace_buffer = torch.empty(
