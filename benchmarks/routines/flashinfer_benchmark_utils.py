@@ -134,6 +134,7 @@ benchmark_apis = {
         "bmm_fp8",
         "bmm_mxfp8",
         "mm_fp4",
+        "mm_mxfp8",
     ],
     "moe": [
         "trtllm_fp4_block_scale_moe",
@@ -287,6 +288,16 @@ routine_cc_to_supported_backends = {
         "12.0": ["cudnn", "cublas"],
     },
     "bmm_mxfp8": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": ["cudnn"],
+        "10.3": ["cudnn"],
+        "12.0": [],
+    },
+    "mm_mxfp8": {
         "7.5": [],
         "8.0": [],
         "8.6": [],

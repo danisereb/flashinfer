@@ -43,6 +43,7 @@ from ..utils import (
     is_sm121a_supported,
     LibraryError,
     backend_requirement,
+    round_up,
     supported_compute_capability,
 )
 from ..jit.gemm import gen_gemm_sm90_module
@@ -2400,6 +2401,230 @@ def mm_fp8(
     return out
 
 
+def _check_mm_mxfp8_problem_size(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_descale: torch.Tensor,
+    b_descale: torch.Tensor,
+    out: Optional[torch.Tensor] = None,  # unused
+    out_dtype: torch.dtype = torch.bfloat16,
+    backend: Literal["cudnn"] = "cudnn",  # unused
+) -> bool:
+    # Generic checks
+    ## pre-check the input tensors and block scale tensors
+    if a.ndim != 2 or b.ndim != 2:
+        raise ValueError(f"mm_mxfp8 accepts 2d tensors, got {a.shape=} and {b.shape=}")
+
+    if a.shape[1] != b.shape[0]:
+        raise ValueError(
+            f"K dimension mismatch in mm_mxfp8. got {a.shape[1]=}, {b.shape[0]=}"
+        )
+
+    # Input dtype as returned by mxfp8_quantize_sm100
+    if a.dtype != torch.float8_e4m3fn:
+        raise ValueError(f"a must be a float8_e4m3fn tensor, got {a.dtype=}")
+
+    if b.dtype != torch.float8_e4m3fn:
+        raise ValueError(f"b must be a float8_e4m3fn tensor, got {b.dtype=}")
+
+    # Scale dtype as returned by mxfp8_quantize_sm100
+    if a_descale.dtype != torch.uint8:
+        raise ValueError(f"a_descale must be a uint8 tensor, got {a_descale.dtype=}")
+
+    if b_descale.dtype != torch.uint8:
+        raise ValueError(f"b_descale must be a uint8 tensor, got {b_descale.dtype=}")
+
+    _validate_mxfp8_output_dtype(out_dtype)
+    return True
+
+
+@supported_compute_capability([100, 103, 110, 120, 121])
+def _cudnn_gemm_mxfp8_requirement(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_descale: torch.Tensor,
+    b_descale: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    backend: Literal["cudnn"] = "cudnn",
+) -> bool:
+    # MXFP8 is only supported with compute capability 10.0 or higher.
+
+    # TODO: implement this
+    return True
+
+
+def _heuristic_func_mm_mxfp8(
+    suitable_backends: List[str],
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_descale: torch.Tensor,
+    b_descale: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    backend: Literal["cudnn"] = "cudnn",
+) -> List[str]:
+    if CUDNN_AVAILABLE and "cudnn" in suitable_backends:
+        return ["cudnn"]
+    return []
+
+
+@backend_requirement(
+    {
+        "cudnn": _cudnn_gemm_mxfp8_requirement,
+    },
+    common_check=_check_mm_mxfp8_problem_size,
+    heuristic_func=_heuristic_func_mm_mxfp8,  # result stored in mm_mxfp8.suitable_auto_backends
+)
+def mm_mxfp8(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_descale: torch.Tensor,
+    b_descale: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    backend: Literal["cudnn"] = "cudnn",
+) -> torch.Tensor:
+    r"""MM MXFP8 (block size 32)
+
+    Parameters
+    ----------
+    a: torch.Tensor
+        Input A tensor, shape (m, k), mxfp8 e4m3.
+
+    b: torch.Tensor
+        Input Btensor, shape (k, n), should be column major, mxfp8 e4m3.
+
+    a_descale: torch.Tensor
+        Block scale tensor for A. Can be:
+        - 2D non-swizzled: shape (m, k // 32)
+        - 1D swizzled: shape (M_padded * K_padded,) where M_padded = round_up(m, 128), K_padded = round_up(k // 32, 4)
+        dtype: float8_e4m3fn or uint8.
+
+    b_descale: torch.Tensor
+        Block scale tensor for B. Can be:
+        - 2D non-swizzled: shape (k // 32, n) - transposed format
+        - 1D swizzled: shape (N_padded * K_padded,) where N_padded = round_up(n, 128), K_padded = round_up(k // 32, 4)
+        dtype: float8_e4m3fn or uint8.
+        Note: For 2D format, this is the transposed version (typically passed as scale.t()).
+        For 1D swizzled format, it's flattened from (N_padded, K_padded) layout.
+
+    out: Optional[torch.Tensor]
+        Out tensor, shape (m, n), bf16 or fp16. If provided, can only be used with the CUTLASS backend. Defaults to ``None``.
+
+    out_dtype: torch.dtype
+        Output dtype, bf16 or fp16. Can be used with the  cuDNN backends. Defaults to ``torch.bfloat16``.
+
+    backend: Literal["cudnn"]
+        The backend to use for the operation. Defaults to ``"cudnn"``.
+        ``"cudnn"`` uses the cuDNN backend.
+
+    Returns
+    -------
+    out: torch.Tensor
+        Out tensor, shape (m, n), bf16 or fp16.
+
+    Examples
+    --------
+    >>> import torch
+    >>> from flashinfer import mxfp8_quantize, mm_mxfp8
+    >>> m, n, k = 48, 256, 128
+    >>> a = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
+    >>> b = torch.randn([k, n], device="cuda", dtype=torch.bfloat16)
+    >>> # Option 1: Use swizzled layout for optimal performance (recommended)
+    >>> a_mx, a_sf = mxfp8_quantize(input=a, is_sf_swizzled_layout=True)
+    >>> b_mx, b_sf = mxfp8_quantize(input=b, is_sf_swizzled_layout=True)
+    >>> # For b_descale, reshape from (n * k // 32,) to (n, k // 32), then transpose
+    >>> b_sf_2d = b_sf.view(-1, k // 32).t().contiguous() if b_sf.ndim == 2 else b_sf.view(n, k // 32).t().contiguous()
+    >>> # mm_mxfp8 will automatically handle swizzled 1D scales
+    >>> out = mm_mxfp8(a_mx, b_mx.t(), a_sf, b_sf_2d, torch.bfloat16)
+    >>> out.shape
+    torch.Size([48, 256])
+    >>> # Option 2: Use non-swizzled layout (for compatibility)
+    >>> a_mx, a_sf = mxfp8_quantize(input=a, is_sf_swizzled_layout=False)
+    >>> b_mx, b_sf = mxfp8_quantize(input=b, is_sf_swizzled_layout=False)
+    >>> a_sf_2d = a_sf.view(m, k // 32)
+    >>> b_sf_2d = b_sf.view(n, k // 32).t()  # Transpose to (k // 32, n)
+    >>> out = mm_mxfp8(a_mx, b_mx.t(), a_sf_2d, b_sf_2d, torch.bfloat16)
+    >>> out.shape
+    torch.Size([48, 256])
+    """
+
+    # Handle swizzled scales: reshape 1D swizzled scales to 2D padded format for cuDNN
+    # cuDNN's reordering_type=F8_128x4 expects 2D format with proper padding
+    m = a.shape[0]
+    k = a.shape[1]
+    n = b.shape[1]
+    block_size = 32
+
+    # Process a_descale: reshape swizzled 1D to 2D padded format
+    if a_descale.ndim == 1:
+        a_shape, _ = _calculate_mxfp8_swizzled_scale_shape_stride(
+            a_descale, m, k, block_size, is_transposed=False
+        )
+        a_descale = a_descale.view(a_shape)
+
+    # Process b_descale: reshape swizzled 1D to 2D padded format (transposed)
+    if b_descale.ndim == 1:
+        # Calculate padded dimensions
+        scale_k = k // block_size
+        n_padded = round_up(n, 128)
+        k_padded = round_up(scale_k, 4)
+        # Reshape to (n_padded, k_padded) first, then transpose to (k_padded, n_padded)
+        # Note: The swizzled memory layout is preserved through view/transpose
+        b_descale = b_descale.view(n_padded, k_padded).t().contiguous()
+
+    # allocate the output tensor if not provided
+    if out is None:
+        out = torch.empty(
+            (a.shape[0], b.shape[1]),
+            device=a.device,
+            dtype=out_dtype,
+        )
+
+    workspace_buffer = _get_cache_buf(
+        "mm_mxfp8_workspace", DEFAULT_WORKSPACE_SIZE, a.device
+    )
+
+    # Auto-select the best backend
+    if backend == "auto":
+        backends = mm_mxfp8.suitable_auto_backends
+    else:
+        backends = [backend]
+
+    backend_to_runner_factory = {
+        "cudnn": lambda: _cudnn_gemm_mxfp8_runner(),
+    }
+
+    runners = [backend_to_runner_factory[cur_backend]() for cur_backend in backends]
+
+    # Now we have a list of runners for desired & supported backends.
+    tuner = AutoTuner.get()
+
+    # Use tuning config for MXFP8 (similar to FP4 128x4 layout)
+    tuning_config = _MM_MXFP8_TUNING_CONFIG
+
+    inputs = [
+        a,
+        b,
+        a_descale,
+        b_descale,
+        out_dtype,
+        out,
+        workspace_buffer,
+    ]
+
+    runner, tactic = tuner.choose_one(
+        "mxfp8_gemm",
+        runners,
+        tuning_config,
+        inputs,
+    )
+
+    runner(inputs=inputs, tactic=tactic)
+    return out
+
+
 def _get_cudnn_fp4_gemm_graph(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -2809,6 +3034,30 @@ _MM_FP4_TUNING_CONFIG_128x4 = TuningConfig(
         ),
         ConstraintSpec(
             6,  # out_tensor_index
+            0,
+            lambda shapes: shapes[0][0],
+        ),
+    ),
+)
+
+
+_MM_MXFP8_TUNING_CONFIG = TuningConfig(
+    dynamic_tensor_specs=(
+        DynamicTensorSpec(
+            (0,),  # a_tensor_index
+            (0,),
+            get_last_power_of_2_num_tokens_buckets,
+            last_positive_power_of_2,
+        ),
+    ),
+    constraint_specs=(
+        ConstraintSpec(
+            2,  # a_descale_tensor_index
+            0,
+            lambda shapes: _pad_up(shapes[0][0], 128),
+        ),
+        ConstraintSpec(
+            5,  # out_tensor_index
             0,
             lambda shapes: shapes[0][0],
         ),
@@ -4522,6 +4771,60 @@ def _calculate_block_scale_dims(
     return block_scale_dim_m, block_scale_dim_n, block_scale_dim_k
 
 
+def _calculate_mxfp8_swizzled_scale_shape_stride(
+    scale_tensor: torch.Tensor,
+    m_or_n: int,
+    k: int,
+    block_size: int = 32,
+    is_transposed: bool = False,
+):
+    """
+    Calculate shape and stride for swizzled MXFP8 scales for cuDNN.
+
+    Swizzled scales are in F8_128x4 layout: flattened 1D tensor with padding.
+    For cuDNN, we need to reshape to padded 2D format: (M_padded, K_padded) or (K_padded, N_padded)
+    where M_padded/N_padded = round_up(M/N, 128) and K_padded = round_up(K/block_size, 4).
+
+    Args:
+        scale_tensor: Swizzled scale tensor (1D flattened or 2D padded)
+        m_or_n: M dimension (for a_descale) or N dimension (for b_descale) of the original tensor
+        k: K dimension of the original tensor (not K/block_size)
+        block_size: Block size for MXFP8 (default 32)
+        is_transposed: If True, calculate for transposed format (K_padded, N_padded) for b_descale
+
+    Returns:
+        Tuple of (shape, stride) for cuDNN
+    """
+
+    scale_k = k // block_size
+    m_or_n_padded = round_up(m_or_n, 128)
+    k_padded = round_up(scale_k, 4)
+
+    if scale_tensor.ndim == 1:
+        # Swizzled 1D format: reshape to padded 2D
+        expected_size = m_or_n_padded * k_padded
+        if scale_tensor.numel() != expected_size:
+            raise ValueError(
+                f"Swizzled scale tensor size mismatch: expected {expected_size}, "
+                f"got {scale_tensor.numel()}. M_or_N={m_or_n}, K={k}, "
+                f"M_or_N_padded={m_or_n_padded}, K_padded={k_padded}"
+            )
+        if is_transposed:
+            # For b_descale transposed format: (K_padded, N_padded) with K-major stride
+            shape = (k_padded, m_or_n_padded)
+            stride = (1, k_padded)  # K-major layout
+        else:
+            # For a_descale: (M_padded, K_padded) with K-major stride
+            shape = (m_or_n_padded, k_padded)
+            stride = (k_padded, 1)  # K-major layout
+    else:
+        # Already 2D, use as-is
+        shape = tuple(scale_tensor.shape)
+        stride = tuple(scale_tensor.stride())
+
+    return shape, stride
+
+
 @functools.cache
 def create_cudnn_execution_plans_mxfp8_gemm(
     a_shape,
@@ -4533,11 +4836,20 @@ def create_cudnn_execution_plans_mxfp8_gemm(
     block_size,
     o_type,  # cudnn.data_type, BF16 or FP16
     device,
+    a_descale_shape=None,
+    a_descale_stride=None,
+    b_descale_shape=None,
+    b_descale_stride=None,
 ):
-    if len(a_shape) != 3:
-        raise ValueError(f"A shape must be 3D, got {a_shape}")
-    if len(b_shape) != 3:
-        raise ValueError(f"B shape must be 3D, got {b_shape}")
+    if len(a_shape) != len(b_shape):
+        raise ValueError(
+            f"{a_shape=} and {b_shape=} have different number of dimensions"
+        )
+
+    if len(a_shape) not in [2, 3]:
+        # 2 for mm_mxfp8
+        # 3 for bmm_mxfp8
+        raise ValueError("A and B shapes must be 2D or 3D")
 
     if a_type not in [cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2]:
         raise ValueError(f"A type must be FP8_E4M3 or FP8_E5M2, got {a_type}")
@@ -4546,35 +4858,65 @@ def create_cudnn_execution_plans_mxfp8_gemm(
     if o_type not in [cudnn.data_type.BFLOAT16, cudnn.data_type.HALF]:
         raise ValueError(f"Output type must be BF16 or FP16, got {o_type}")
 
-    # Extract batch, m, n, k dimensions
-    b_dim = a_shape[0]
-    m = a_shape[1]
-    k = a_shape[2]
-    n = b_shape[2]
+    b_dim: int | None = None
+    if len(a_shape) == 3:
+        # For bmm_mxfp8
+        # Extract batch, m, n, k dimensions
+        b_dim = a_shape[0]
+        m = a_shape[1]
+        k = a_shape[2]
+        n = b_shape[2]
+    else:
+        # For mm_mxfp8
+        # Extract m, n, k dimensions
+        m = a_shape[0]
+        k = a_shape[1]
+        n = b_shape[1]
 
-    # Calculate block scale dimensions using indestructible block formula
-    block_scale_dim_m, block_scale_dim_n, block_scale_dim_k = (
-        _calculate_block_scale_dims(m, n, k, block_size)
-    )
+    # Use provided shapes/strides if available (for swizzled scales), otherwise calculate
+    if a_descale_shape is None or a_descale_stride is None:
+        # Calculate block scale dimensions using indestructible block formula
+        block_scale_dim_m, block_scale_dim_n, block_scale_dim_k = (
+            _calculate_block_scale_dims(m, n, k, block_size)
+        )
 
-    # For mxfp8, scale tensors need to be reshaped to 3D with correct strides
-    # cuDNN expects K-major layout: stride for K dimension should be 1
-    # For block_descale_a: shape [b, block_scale_dim_m, block_scale_dim_k], stride [block_scale_dim_m * block_scale_dim_k, block_scale_dim_k, 1]
-    # For block_descale_b: shape [b, block_scale_dim_k, block_scale_dim_n], stride [block_scale_dim_n * block_scale_dim_k, 1, block_scale_dim_k]
+        # For mxfp8, scale tensors need correct shapes and strides based on 2D vs 3D
+        # cuDNN expects K-major layout: stride for K dimension should be 1
+        # For 3D (bmm_mxfp8):
+        #   block_descale_a: shape [b, block_scale_dim_m, block_scale_dim_k], stride [block_scale_dim_m * block_scale_dim_k, block_scale_dim_k, 1]
+        #   block_descale_b: shape [b, block_scale_dim_k, block_scale_dim_n], stride [block_scale_dim_n * block_scale_dim_k, 1, block_scale_dim_k]
+        # For 2D (mm_mxfp8):
+        #   block_descale_a: shape [block_scale_dim_m, block_scale_dim_k], stride [block_scale_dim_k, 1]
+        #   block_descale_b: shape [block_scale_dim_k, block_scale_dim_n], stride [1, block_scale_dim_k]
 
-    a_descale_shape = (b_dim, block_scale_dim_m, block_scale_dim_k)
-    a_descale_stride = (
-        block_scale_dim_m * block_scale_dim_k,
-        block_scale_dim_k,
-        1,
-    )
-
-    b_descale_shape = (b_dim, block_scale_dim_k, block_scale_dim_n)
-    b_descale_stride = (
-        block_scale_dim_n * block_scale_dim_k,
-        1,
-        block_scale_dim_k,
-    )
+        if b_dim is not None:
+            # 3D case: bmm_mxfp8
+            a_descale_shape = (b_dim, block_scale_dim_m, block_scale_dim_k)
+            b_descale_shape = (b_dim, block_scale_dim_k, block_scale_dim_n)
+            # Strides for 3D: [batch_stride, m_stride, k_stride]
+            a_descale_stride = (
+                block_scale_dim_m * block_scale_dim_k,  # batch stride
+                block_scale_dim_k,  # m stride
+                1,  # k stride (K-major layout)
+            )
+            b_descale_stride = (
+                block_scale_dim_n * block_scale_dim_k,  # batch stride
+                1,  # k stride (K-major layout)
+                block_scale_dim_k,  # n stride
+            )
+        else:
+            # 2D case: mm_mxfp8
+            a_descale_shape = (block_scale_dim_m, block_scale_dim_k)
+            b_descale_shape = (block_scale_dim_k, block_scale_dim_n)
+            # Strides for 2D: [m_stride, k_stride] and [k_stride, n_stride]
+            a_descale_stride = (
+                block_scale_dim_k,  # m stride
+                1,  # k stride (K-major layout)
+            )
+            b_descale_stride = (
+                1,  # k stride (K-major layout)
+                block_scale_dim_k,  # n stride
+            )
 
     # MXFP8 uses FP8_E4M3/FP8_E5M2 for quantized data
     # MXFP8 uses FP8_E8M0 for scale data
@@ -4654,11 +4996,52 @@ def create_cudnn_execution_plans_mxfp8_gemm(
 def _get_cudnn_mxfp8_gemm_graph(
     a: torch.Tensor,
     b: torch.Tensor,
+    a_descale: torch.Tensor,
+    b_descale: torch.Tensor,
     out_dtype: torch.dtype = torch.bfloat16,
     out: Optional[torch.Tensor] = None,
     block_size: int = 32,  # mxfp8 block size is 32
     tactic: int = -1,
 ):
+    # Detect if scales are swizzled (1D flattened format)
+    # Swizzled scales are typically 1D with size = M_padded * K_padded
+    a_swizzled = a_descale.ndim == 1
+    b_swizzled = b_descale.ndim == 1
+
+    a_descale_shape = None
+    a_descale_stride = None
+    b_descale_shape = None
+    b_descale_stride = None
+
+    if a_swizzled or b_swizzled:
+        # Calculate dimensions
+        if len(a.shape) == 3:
+            # bmm_mxfp8
+            m = a.shape[1]
+            k = a.shape[2]
+            n = b.shape[2]
+        else:
+            # mm_mxfp8
+            m = a.shape[0]
+            k = a.shape[1]
+            n = b.shape[1]
+
+        if a_swizzled:
+            a_descale_shape, a_descale_stride = (
+                _calculate_mxfp8_swizzled_scale_shape_stride(
+                    a_descale, m, k, block_size, is_transposed=False
+                )
+            )
+        if b_swizzled:
+            # For b_descale, we need to handle transpose: (K/32, N) format
+            # When swizzled, it's flattened from (N_padded, K_padded) then transposed
+            # For cuDNN, we need (K_padded, N_padded) with proper stride
+            b_descale_shape, b_descale_stride = (
+                _calculate_mxfp8_swizzled_scale_shape_stride(
+                    b_descale, n, k, block_size, is_transposed=True
+                )
+            )
+
     graph = create_cudnn_execution_plans_mxfp8_gemm(
         a_shape=a.shape,
         a_stride=a.stride(),
@@ -4669,6 +5052,10 @@ def _get_cudnn_mxfp8_gemm_graph(
         o_type=_torch_data_type_to_cudnn_data_type(out_dtype),
         block_size=block_size,
         device=a.device,
+        a_descale_shape=a_descale_shape,
+        a_descale_stride=a_descale_stride,
+        b_descale_shape=b_descale_shape,
+        b_descale_stride=b_descale_stride,
     )
 
     graph.check_support()
@@ -4696,6 +5083,8 @@ def _cudnn_gemm_mxfp8(
     graph = _get_cudnn_mxfp8_gemm_graph(
         a=a,
         b=b,
+        a_descale=a_descale,
+        b_descale=b_descale,
         out_dtype=out_dtype,
         out=out,
         block_size=block_size,
@@ -4721,9 +5110,33 @@ def _cudnn_gemm_mxfp8_runner():
             inputs: List[torch.Tensor],
             profile: OptimizationProfile,
         ) -> List[int]:
-            # TODO: check if this is correct
-            # cudnn has heuristic for mxfp8 gemm, so we only need to use the default tactic
-            return [0]
+            # cudnn has heuristic for mxp8 gemm,
+            # so we only need to use the default tactic
+            (
+                a,
+                b,
+                a_descale,
+                b_descale,
+                out_dtype,
+                out,
+                workspace_buffer,
+            ) = inputs
+
+            # Graph should have been already cached,
+            # when we ran _cudnn_gemm_mxfp8_requirement
+            graph = _get_cudnn_mxfp8_gemm_graph(
+                a=a,
+                b=b,
+                a_descale=a_descale,
+                b_descale=b_descale,
+                out_dtype=out_dtype,
+                out=out,
+                block_size=32,
+                tactic=-1,
+            )
+
+            num_plans = graph.get_execution_plan_count()
+            return list(range(num_plans))
 
         def forward(
             self,
@@ -4732,14 +5145,22 @@ def _cudnn_gemm_mxfp8_runner():
             do_preparation: bool = False,
             **kwargs,
         ) -> torch.Tensor:
-            a, b, scale_a, scale_b, out, workspace_buffer = inputs
+            (
+                a,
+                b,
+                a_descale,
+                b_descale,
+                out_dtype,
+                out,
+                workspace_buffer,
+            ) = inputs
             _cudnn_gemm_mxfp8(
                 a=a,
                 b=b,
-                a_descale=scale_a,
-                b_descale=scale_b,
+                a_descale=a_descale,
+                b_descale=b_descale,
+                out_dtype=out_dtype,
                 out=out,
-                out_dtype=out.dtype,
                 workspace_buffer=workspace_buffer,
                 tactic=tactic,
             )
