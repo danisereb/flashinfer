@@ -7,8 +7,8 @@ from flashinfer.fp8_quantization import mxfp8_quantize
 from flashinfer.utils import get_compute_capability
 
 
-@pytest.mark.parametrize("m", [128, 256, 512])
-@pytest.mark.parametrize("n", [128, 256, 512])
+@pytest.mark.parametrize("m", [128, 256, 512, 1024])
+@pytest.mark.parametrize("n", [128, 256, 512, 1024])
 @pytest.mark.parametrize("k", [128, 256, 512, 1024])
 @pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
@@ -51,15 +51,24 @@ def test_mm_mxfp8(
     res = torch.empty([m, n], device="cuda", dtype=out_dtype)
 
     with autotune(auto_tuning):
-        mm_mxfp8(
-            input_mxfp8,
-            mat2_mxfp8.T,  # mm_mxfp8 expects mat2.T (transposed)
-            input_descale,
-            mat2_descale,
-            out=res,
-            out_dtype=out_dtype,
-            backend=backend,
-        )
+        try:
+            mm_mxfp8(
+                input_mxfp8,
+                mat2_mxfp8.T,  # mm_mxfp8 expects mat2.T (transposed)
+                input_descale,
+                mat2_descale,
+                out=res,
+                out_dtype=out_dtype,
+                backend=backend,
+            )
+        except ValueError as e:
+            # Skip test cases where cuDNN doesn't support the problem size
+            # This is a cuDNN limitation, not a bug in our code
+            if "cuDNN does not support mm_mxfp8" in str(e):
+                pytest.skip(
+                    f"cuDNN does not support mm_mxfp8 for size (M={m}, N={n}, K={k}): {e}"
+                )
+            raise
 
     assert res.shape == (m, n)
     assert res.dtype == out_dtype

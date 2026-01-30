@@ -2478,11 +2478,48 @@ def _cudnn_gemm_mxfp8_requirement(
         a_swizzled = a_descale.ndim == 1
         b_swizzled = b_descale.ndim == 1
 
+        # Try to extract calculated shapes/strides for debugging
+        debug_info = []
+        try:
+            # Calculate what shapes/strides would be used
+            block_size = 32
+            if a_swizzled:
+                a_calc_shape, a_calc_stride = (
+                    _calculate_mxfp8_swizzled_scale_shape_stride(
+                        a_descale, m, k, block_size, is_transposed=False
+                    )
+                )
+                debug_info.append(
+                    f"a_descale_calculated_shape={a_calc_shape}, stride={a_calc_stride}"
+                )
+            elif a_descale.ndim == 2:
+                debug_info.append(
+                    f"a_descale_shape={a_descale.shape}, stride={a_descale.stride()}"
+                )
+
+            if b_swizzled:
+                b_calc_shape, b_calc_stride = (
+                    _calculate_mxfp8_swizzled_scale_shape_stride(
+                        b_descale, n, k, block_size, is_transposed=True
+                    )
+                )
+                debug_info.append(
+                    f"b_descale_calculated_shape={b_calc_shape}, stride={b_calc_stride}"
+                )
+            elif b_descale.ndim == 2:
+                debug_info.append(
+                    f"b_descale_shape={b_descale.shape}, stride={b_descale.stride()}"
+                )
+        except Exception as calc_e:
+            debug_info.append(f"(Could not calculate shapes: {calc_e})")
+
         # Check if it's a "no valid engine configs" error (cuDNN size limitation)
         error_str = str(e)
         is_size_limitation = "No valid engine configs" in error_str or isinstance(
             e, (RuntimeError, ValueError)
         )
+
+        debug_str = " | ".join(debug_info) if debug_info else ""
 
         if is_size_limitation:
             error_msg = (
@@ -2492,6 +2529,7 @@ def _cudnn_gemm_mxfp8_requirement(
                 f"a_descale.shape={a_descale.shape} ({'swizzled' if a_swizzled else 'non-swizzled'}), "
                 f"b_descale.shape={b_descale.shape} ({'swizzled' if b_swizzled else 'non-swizzled'}), "
                 f"out_dtype={out_dtype}. "
+                f"{debug_str}. "
                 f"Original cuDNN error: {type(e).__name__}: {error_str[:500]}"
             )
         else:
@@ -2501,6 +2539,7 @@ def _cudnn_gemm_mxfp8_requirement(
                 f"a_descale.shape={a_descale.shape} ({'swizzled' if a_swizzled else 'non-swizzled'}), "
                 f"b_descale.shape={b_descale.shape} ({'swizzled' if b_swizzled else 'non-swizzled'}), "
                 f"out_dtype={out_dtype}. "
+                f"{debug_str}. "
                 f"Original error: {type(e).__name__}: {str(e)}"
             )
         raise ValueError(error_msg) from e
