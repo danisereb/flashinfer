@@ -2604,6 +2604,23 @@ def mm_mxfp8(
     torch.Size([48, 256])
     """
 
+    # Validate input tensors
+    assert a.ndim == 2, f"mm_mxfp8: a must be 2D, got {a.ndim}D with shape {a.shape}"
+    assert b.ndim == 2, f"mm_mxfp8: b must be 2D, got {b.ndim}D with shape {b.shape}"
+    assert a.shape[1] == b.shape[0], (
+        f"mm_mxfp8: K dimension mismatch: a.shape[1]={a.shape[1]}, b.shape[0]={b.shape[0]}"
+    )
+
+    # Validate scale tensors
+    assert a_descale.ndim in (1, 2), (
+        f"mm_mxfp8: a_descale must be 1D (swizzled) or 2D (non-swizzled), "
+        f"got {a_descale.ndim}D with shape {a_descale.shape}, dtype={a_descale.dtype}"
+    )
+    assert b_descale.ndim in (1, 2), (
+        f"mm_mxfp8: b_descale must be 1D (swizzled) or 2D (non-swizzled), "
+        f"got {b_descale.ndim}D with shape {b_descale.shape}, dtype={b_descale.dtype}"
+    )
+
     # Handle swizzled scales: reshape 1D swizzled scales to 2D padded format for cuDNN
     # cuDNN's reordering_type=F8_128x4 expects 2D format with proper padding
     m = a.shape[0]
@@ -2616,6 +2633,10 @@ def mm_mxfp8(
         a_shape, _ = _calculate_mxfp8_swizzled_scale_shape_stride(
             a_descale, m, k, block_size, is_transposed=False
         )
+        assert a_descale.numel() == a_shape[0] * a_shape[1], (
+            f"mm_mxfp8: a_descale size mismatch for view: "
+            f"numel={a_descale.numel()}, expected shape={a_shape} (size={a_shape[0] * a_shape[1]})"
+        )
         a_descale = a_descale.view(a_shape)
 
     # Process b_descale: reshape swizzled 1D to 2D padded format (transposed)
@@ -2624,6 +2645,12 @@ def mm_mxfp8(
         scale_k = k // block_size
         n_padded = round_up(n, 128)
         k_padded = round_up(scale_k, 4)
+        expected_size = n_padded * k_padded
+        assert b_descale.numel() == expected_size, (
+            f"mm_mxfp8: b_descale size mismatch for view: "
+            f"numel={b_descale.numel()}, expected {expected_size} "
+            f"(n_padded={n_padded}, k_padded={k_padded}, n={n}, scale_k={scale_k})"
+        )
         # Reshape to (n_padded, k_padded) first, then transpose to (k_padded, n_padded)
         # Note: The swizzled memory layout is preserved through view/transpose
         b_descale = b_descale.view(n_padded, k_padded).t().contiguous()
@@ -4849,6 +4876,15 @@ def _calculate_mxfp8_swizzled_scale_shape_stride(
     Returns:
         Tuple of (shape, stride) for cuDNN
     """
+    # Validate inputs
+    assert m_or_n > 0, f"m_or_n must be positive, got {m_or_n}"
+    assert k > 0, f"k must be positive, got {k}"
+    assert k % block_size == 0, (
+        f"k ({k}) must be divisible by block_size ({block_size})"
+    )
+    assert scale_tensor.ndim in (1, 2), (
+        f"scale_tensor must be 1D or 2D, got {scale_tensor.ndim}D with shape {scale_tensor.shape}"
+    )
 
     scale_k = k // block_size
     m_or_n_padded = round_up(m_or_n, 128)
@@ -4861,7 +4897,9 @@ def _calculate_mxfp8_swizzled_scale_shape_stride(
             raise ValueError(
                 f"Swizzled scale tensor size mismatch: expected {expected_size}, "
                 f"got {scale_tensor.numel()}. M_or_N={m_or_n}, K={k}, "
-                f"M_or_N_padded={m_or_n_padded}, K_padded={k_padded}"
+                f"M_or_N_padded={m_or_n_padded}, K_padded={k_padded}, "
+                f"block_size={block_size}, scale_k={scale_k}, "
+                f"is_transposed={is_transposed}, scale_tensor.shape={scale_tensor.shape}"
             )
         if is_transposed:
             # For b_descale transposed format: (K_padded, N_padded) with K-major stride
@@ -4871,10 +4909,23 @@ def _calculate_mxfp8_swizzled_scale_shape_stride(
             # For a_descale: (M_padded, K_padded) with K-major stride
             shape = (m_or_n_padded, k_padded)
             stride = (k_padded, 1)  # K-major layout
+
+        # Validate calculated shape/stride
+        assert len(shape) == 2, f"shape should be 2D, got {shape}"
+        assert len(stride) == 2, f"stride should be 2D, got {stride}"
+        assert shape[0] * shape[1] == expected_size, (
+            f"shape size mismatch: shape={shape}, expected_size={expected_size}"
+        )
     else:
         # Already 2D, use as-is
         shape = tuple(scale_tensor.shape)
         stride = tuple(scale_tensor.stride())
+        assert len(shape) == 2, (
+            f"2D scale_tensor should have 2 dimensions, got shape {shape}"
+        )
+        assert len(stride) == 2, (
+            f"2D scale_tensor should have 2 stride dimensions, got stride {stride}"
+        )
 
     return shape, stride
 
@@ -4894,6 +4945,8 @@ def create_cudnn_execution_plans_mxfp8_gemm(
     a_descale_stride=None,
     b_descale_shape=None,
     b_descale_stride=None,
+    a_swizzled=False,
+    b_swizzled=False,
 ):
     if len(a_shape) != len(b_shape):
         raise ValueError(
@@ -4928,6 +4981,8 @@ def create_cudnn_execution_plans_mxfp8_gemm(
         n = b_shape[1]
 
     # Use provided shapes/strides if available (for swizzled scales), otherwise calculate
+    # Note: a_descale_shape/b_descale_shape should always be provided now (from _get_cudnn_mxfp8_gemm_graph)
+    # This fallback is kept for backward compatibility
     if a_descale_shape is None or a_descale_stride is None:
         # Calculate block scale dimensions using indestructible block formula
         block_scale_dim_m, block_scale_dim_n, block_scale_dim_k = (
@@ -4976,12 +5031,8 @@ def create_cudnn_execution_plans_mxfp8_gemm(
     # MXFP8 uses FP8_E8M0 for scale data
     scale_type = cudnn.data_type.FP8_E8M0
 
-    # Determine if scales are swizzled: if a_descale_shape/b_descale_shape were provided
-    # (not None), they came from swizzled 1D tensors. If None, they were calculated
-    # from 2D non-swizzled scales.
     # F8_128x4 reordering_type should only be used for swizzled scales.
-    a_swizzled = a_descale_shape is not None
-    b_swizzled = b_descale_shape is not None
+    # The swizzled flag is passed explicitly to indicate if scales are swizzled (1D).
 
     stream = torch.cuda.current_stream(device)
     with cudnn.graph(_get_cudnn_handle(stream)) as (graph, _):
@@ -4997,6 +5048,34 @@ def create_cudnn_execution_plans_mxfp8_gemm(
             stride=tuple(b_stride),  # [k * n, 1, k]
             data_type=b_type,
         )
+        # Validate shapes/strides before creating cuDNN tensors
+        assert a_descale_shape is not None, (
+            f"a_descale_shape is None when creating cuDNN tensor. "
+            f"a_swizzled={a_swizzled}, a_descale_shape={a_descale_shape}"
+        )
+        assert a_descale_stride is not None, (
+            f"a_descale_stride is None when creating cuDNN tensor. "
+            f"a_swizzled={a_swizzled}, a_descale_stride={a_descale_stride}"
+        )
+        assert b_descale_shape is not None, (
+            f"b_descale_shape is None when creating cuDNN tensor. "
+            f"b_swizzled={b_swizzled}, b_descale_shape={b_descale_shape}"
+        )
+        assert b_descale_stride is not None, (
+            f"b_descale_stride is None when creating cuDNN tensor. "
+            f"b_swizzled={b_swizzled}, b_descale_stride={b_descale_stride}"
+        )
+        assert len(a_descale_shape) == len(a_descale_stride), (
+            f"a_descale_shape and a_descale_stride length mismatch: "
+            f"shape={a_descale_shape} (len={len(a_descale_shape)}), "
+            f"stride={a_descale_stride} (len={len(a_descale_stride)})"
+        )
+        assert len(b_descale_shape) == len(b_descale_stride), (
+            f"b_descale_shape and b_descale_stride length mismatch: "
+            f"shape={b_descale_shape} (len={len(b_descale_shape)}), "
+            f"stride={b_descale_stride} (len={len(b_descale_stride)})"
+        )
+
         # Conditionally set reordering_type based on whether scales are swizzled
         a_reordering_type = cudnn.tensor_reordering.F8_128x4 if a_swizzled else None
         b_reordering_type = cudnn.tensor_reordering.F8_128x4 if b_swizzled else None
@@ -5075,6 +5154,23 @@ def _get_cudnn_mxfp8_gemm_graph(
     block_size: int = 32,  # mxfp8 block size is 32
     tactic: int = -1,
 ):
+    # Validate input tensors
+    assert a.ndim in (2, 3), f"a must be 2D or 3D, got {a.ndim}D with shape {a.shape}"
+    assert b.ndim in (2, 3), f"b must be 2D or 3D, got {b.ndim}D with shape {b.shape}"
+    assert a.ndim == b.ndim, (
+        f"a and b must have same number of dimensions: a.ndim={a.ndim}, b.ndim={b.ndim}"
+    )
+
+    # Validate scale tensors
+    assert a_descale.ndim in (1, 2), (
+        f"a_descale must be 1D (swizzled) or 2D (non-swizzled), "
+        f"got {a_descale.ndim}D with shape {a_descale.shape}, dtype={a_descale.dtype}"
+    )
+    assert b_descale.ndim in (1, 2), (
+        f"b_descale must be 1D (swizzled) or 2D (non-swizzled), "
+        f"got {b_descale.ndim}D with shape {b_descale.shape}, dtype={b_descale.dtype}"
+    )
+
     # Detect if scales are swizzled (1D flattened format)
     # Swizzled scales are typically 1D with size = M_padded * K_padded
     a_swizzled = a_descale.ndim == 1
@@ -5085,34 +5181,122 @@ def _get_cudnn_mxfp8_gemm_graph(
     b_descale_shape = None
     b_descale_stride = None
 
-    if a_swizzled or b_swizzled:
-        # Calculate dimensions
-        if len(a.shape) == 3:
-            # bmm_mxfp8
-            m = a.shape[1]
-            k = a.shape[2]
-            n = b.shape[2]
-        else:
-            # mm_mxfp8
-            m = a.shape[0]
-            k = a.shape[1]
-            n = b.shape[1]
+    # Calculate dimensions
+    if len(a.shape) == 3:
+        # bmm_mxfp8
+        m = a.shape[1]
+        k = a.shape[2]
+        n = b.shape[2]
+        assert a.shape[0] == b.shape[0], (
+            f"Batch dimension mismatch: a.shape[0]={a.shape[0]}, b.shape[0]={b.shape[0]}"
+        )
+    else:
+        # mm_mxfp8
+        m = a.shape[0]
+        k = a.shape[1]
+        n = b.shape[1]
+        assert a.shape[1] == b.shape[0], (
+            f"K dimension mismatch: a.shape[1]={a.shape[1]}, b.shape[0]={b.shape[0]}"
+        )
 
-        if a_swizzled:
-            a_descale_shape, a_descale_stride = (
-                _calculate_mxfp8_swizzled_scale_shape_stride(
-                    a_descale, m, k, block_size, is_transposed=False
-                )
+    if a_swizzled:
+        # Swizzled 1D scale: calculate shape/stride from dimensions
+        a_descale_shape, a_descale_stride = (
+            _calculate_mxfp8_swizzled_scale_shape_stride(
+                a_descale, m, k, block_size, is_transposed=False
             )
-        if b_swizzled:
-            # For b_descale, we need to handle transpose: (K/32, N) format
-            # When swizzled, it's flattened from (N_padded, K_padded) then transposed
-            # For cuDNN, we need (K_padded, N_padded) with proper stride
-            b_descale_shape, b_descale_stride = (
-                _calculate_mxfp8_swizzled_scale_shape_stride(
-                    b_descale, n, k, block_size, is_transposed=True
-                )
+        )
+        assert a_descale_shape is not None, (
+            "a_descale_shape should not be None after calculation"
+        )
+        assert a_descale_stride is not None, (
+            "a_descale_stride should not be None after calculation"
+        )
+    elif a_descale.ndim == 2:
+        # Non-swizzled 2D scale: extract shape/stride from tensor
+        a_descale_shape = tuple(a_descale.shape)
+        a_descale_stride = tuple(a_descale.stride())
+        # Validate expected dimensions for 2D scale
+        expected_scale_k = k // block_size
+        if len(a.shape) == 3:
+            # bmm_mxfp8: expect (b, m, scale_k) or similar
+            assert len(a_descale_shape) == 3, (
+                f"a_descale for bmm_mxfp8 should be 3D, got shape {a_descale_shape}"
             )
+        else:
+            # mm_mxfp8: expect (m, scale_k)
+            assert len(a_descale_shape) == 2, (
+                f"a_descale for mm_mxfp8 should be 2D, got shape {a_descale_shape}"
+            )
+            assert a_descale_shape[1] == expected_scale_k, (
+                f"a_descale K dimension mismatch: expected {expected_scale_k} (k={k} // block_size={block_size}), "
+                f"got {a_descale_shape[1]}"
+            )
+    else:
+        raise ValueError(
+            f"a_descale has unsupported ndim: {a_descale.ndim}, shape={a_descale.shape}. "
+            f"Expected 1D (swizzled) or 2D (non-swizzled)"
+        )
+
+    if b_swizzled:
+        # Swizzled 1D scale: calculate shape/stride from dimensions
+        # For b_descale, we need to handle transpose: (K/32, N) format
+        # When swizzled, it's flattened from (N_padded, K_padded) then transposed
+        # For cuDNN, we need (K_padded, N_padded) with proper stride
+        b_descale_shape, b_descale_stride = (
+            _calculate_mxfp8_swizzled_scale_shape_stride(
+                b_descale, n, k, block_size, is_transposed=True
+            )
+        )
+        assert b_descale_shape is not None, (
+            "b_descale_shape should not be None after calculation"
+        )
+        assert b_descale_stride is not None, (
+            "b_descale_stride should not be None after calculation"
+        )
+    elif b_descale.ndim == 2:
+        # Non-swizzled 2D scale: extract shape/stride from tensor
+        b_descale_shape = tuple(b_descale.shape)
+        b_descale_stride = tuple(b_descale.stride())
+        # Validate expected dimensions for 2D scale
+        expected_scale_k = k // block_size
+        if len(a.shape) == 3:
+            # bmm_mxfp8: expect (b, scale_k, n) or similar (transposed format)
+            assert len(b_descale_shape) == 3, (
+                f"b_descale for bmm_mxfp8 should be 3D, got shape {b_descale_shape}"
+            )
+        else:
+            # mm_mxfp8: expect (scale_k, n) - transposed format
+            assert len(b_descale_shape) == 2, (
+                f"b_descale for mm_mxfp8 should be 2D, got shape {b_descale_shape}"
+            )
+            assert b_descale_shape[0] == expected_scale_k, (
+                f"b_descale K dimension mismatch: expected {expected_scale_k} (k={k} // block_size={block_size}), "
+                f"got {b_descale_shape[0]}"
+            )
+    else:
+        raise ValueError(
+            f"b_descale has unsupported ndim: {b_descale.ndim}, shape={b_descale.shape}. "
+            f"Expected 1D (swizzled) or 2D (non-swizzled)"
+        )
+
+    # Final validation: ensure shapes/strides are set
+    assert a_descale_shape is not None, (
+        f"a_descale_shape is None after processing. a_descale.ndim={a_descale.ndim}, "
+        f"a_descale.shape={a_descale.shape}, a_swizzled={a_swizzled}"
+    )
+    assert a_descale_stride is not None, (
+        f"a_descale_stride is None after processing. a_descale.ndim={a_descale.ndim}, "
+        f"a_descale.shape={a_descale.shape}, a_swizzled={a_swizzled}"
+    )
+    assert b_descale_shape is not None, (
+        f"b_descale_shape is None after processing. b_descale.ndim={b_descale.ndim}, "
+        f"b_descale.shape={b_descale.shape}, b_swizzled={b_swizzled}"
+    )
+    assert b_descale_stride is not None, (
+        f"b_descale_stride is None after processing. b_descale.ndim={b_descale.ndim}, "
+        f"b_descale.shape={b_descale.shape}, b_swizzled={b_swizzled}"
+    )
 
     graph = create_cudnn_execution_plans_mxfp8_gemm(
         a_shape=a.shape,
@@ -5128,6 +5312,8 @@ def _get_cudnn_mxfp8_gemm_graph(
         a_descale_stride=a_descale_stride,
         b_descale_shape=b_descale_shape,
         b_descale_stride=b_descale_stride,
+        a_swizzled=a_swizzled,
+        b_swizzled=b_swizzled,
     )
 
     graph.check_support()
