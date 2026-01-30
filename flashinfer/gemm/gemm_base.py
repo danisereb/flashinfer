@@ -2660,39 +2660,11 @@ def mm_mxfp8(
         f"got {b_descale.ndim}D with shape {b_descale.shape}, dtype={b_descale.dtype}"
     )
 
-    # Handle swizzled scales: reshape 1D swizzled scales to 2D padded format for cuDNN
-    # cuDNN's reordering_type=F8_128x4 expects 2D format with proper padding
-    m = a.shape[0]
-    k = a.shape[1]
-    n = b.shape[1]
-    block_size = 32
-
-    # Process a_descale: reshape swizzled 1D to 2D padded format
-    if a_descale.ndim == 1:
-        a_shape, _ = _calculate_mxfp8_swizzled_scale_shape_stride(
-            a_descale, m, k, block_size, is_transposed=False
-        )
-        assert a_descale.numel() == a_shape[0] * a_shape[1], (
-            f"mm_mxfp8: a_descale size mismatch for view: "
-            f"numel={a_descale.numel()}, expected shape={a_shape} (size={a_shape[0] * a_shape[1]})"
-        )
-        a_descale = a_descale.view(a_shape)
-
-    # Process b_descale: reshape swizzled 1D to 2D padded format (transposed)
-    if b_descale.ndim == 1:
-        # Calculate padded dimensions
-        scale_k = k // block_size
-        n_padded = round_up(n, 128)
-        k_padded = round_up(scale_k, 4)
-        expected_size = n_padded * k_padded
-        assert b_descale.numel() == expected_size, (
-            f"mm_mxfp8: b_descale size mismatch for view: "
-            f"numel={b_descale.numel()}, expected {expected_size} "
-            f"(n_padded={n_padded}, k_padded={k_padded}, n={n}, scale_k={scale_k})"
-        )
-        # Reshape to (n_padded, k_padded) first, then transpose to (k_padded, n_padded)
-        # Note: The swizzled memory layout is preserved through view/transpose
-        b_descale = b_descale.view(n_padded, k_padded).t().contiguous()
+    # NOTE: Do NOT reshape swizzled 1D scales to 2D!
+    # The swizzled memory layout (F8_128x4) must be preserved as-is.
+    # The _get_cudnn_mxfp8_gemm_graph function will handle 1D swizzled scales
+    # by detecting ndim==1 and calculating the appropriate shape/stride for cuDNN.
+    # Reshaping with .view() followed by .t().contiguous() would destroy the swizzled layout.
 
     # allocate the output tensor if not provided
     if out is None:
