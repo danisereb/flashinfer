@@ -23,42 +23,39 @@ def test_mm_mxfp8(
         pytest.skip("Not tested on SM110/SM120/SM121")
     if compute_capability[0] < 10:
         pytest.skip(
-            "bmm_mxfp8 with cudnn backend is only supported on SM100 and above GPUs."
+            "mm_mxfp8 with cudnn backend is only supported on SM100 and above GPUs."
         )
 
-    a = torch.randn([m, k], device="cuda", dtype=input_dtype)
-    b = torch.randn([k, n], device="cuda", dtype=input_dtype)
+    input = torch.randn([m, k], device="cuda", dtype=input_dtype)
+    mat2 = torch.randn([n, k], device="cuda", dtype=input_dtype)
 
-    a_mxfp8, a_scale = mxfp8_quantize(a, is_sf_swizzled_layout)
-    b_mxfp8, b_scale = mxfp8_quantize(b, is_sf_swizzled_layout)
+    input_mxfp8, input_scale = mxfp8_quantize(input, is_sf_swizzled_layout)
+    mat2_mxfp8, mat2_scale = mxfp8_quantize(mat2, is_sf_swizzled_layout)
 
-    # Compute reference result: mm_mxfp8 expects b.t(), so reference should be a @ b.t()
-    reference = torch.mm(a, b.t())
+    # Compute reference result: mm_mxfp8 receives mat2.T (shape [k, n]) and computes input @ mat2.T
+    reference = torch.mm(input, mat2.T)
 
     # Prepare scales according to mm_mxfp8's expected format
-    # For a_descale: can be 1D swizzled or 2D (m, k//32)
-    # For b_descale: mm_mxfp8 expects (k//32, n) format (transposed)
+    # For input_descale: can be 1D swizzled or 2D (m, k//32)
+    # For mat2_descale: mm_mxfp8 expects (k//32, n) format (transposed)
     if is_sf_swizzled_layout:
         # Swizzled: 1D format - mm_mxfp8 will handle reshaping internally
-        # For b_descale, we need to handle the transpose format
-        # Swizzled b_scale is flattened from (n_padded, k_padded), but mm_mxfp8
-        # expects it in a format that can be reshaped to (n_padded, k_padded) then transposed
-        a_descale = a_scale
-        b_descale = b_scale  # mm_mxfp8 will handle swizzled 1D internally
+        input_descale = input_scale
+        mat2_descale = mat2_scale  # mm_mxfp8 will handle swizzled 1D internally
     else:
-        # Non-swizzled: reshape to 2D and transpose b_descale
-        a_descale = a_scale.view(m, k // 32)
-        b_descale = b_scale.view(n, k // 32).t()  # Transpose to (k // 32, n)
+        # Non-swizzled: reshape to 2D and transpose mat2_descale
+        input_descale = input_scale.view(m, k // 32)
+        mat2_descale = mat2_scale.view(n, k // 32).t()  # Transpose to (k // 32, n)
 
     # Create output tensor
     res = torch.empty([m, n], device="cuda", dtype=out_dtype)
 
     with autotune(auto_tuning):
         mm_mxfp8(
-            a=a_mxfp8,
-            b=b_mxfp8.t(),  # mm_mxfp8 expects b.t() (transposed)
-            a_descale=a_descale,
-            b_descale=b_descale,
+            input_mxfp8,
+            mat2_mxfp8.T,  # mm_mxfp8 expects mat2.T (transposed)
+            input_descale,
+            mat2_descale,
             out=res,
             out_dtype=out_dtype,
             backend=backend,
