@@ -5183,6 +5183,52 @@ def create_cudnn_execution_plans_mxfp8_gemm(
         return graph
 
 
+def _expand_mxfp8_tensor_to_3d(tensor: torch.Tensor):
+    """Expand 2D tensor to 3D with batch=1 for cuDNN, similar to FP4.
+
+    cuDNN MXFP8 GEMM only supports 3D batch matrices, so we need to expand
+    2D tensors to 3D with batch=1, just like FP4 does.
+    """
+    shape = list(tensor.shape)
+    stride = list(tensor.stride())
+
+    if len(shape) == 2:
+        # Insert batch dimension at the beginning
+        shape.insert(0, 1)
+        stride.insert(0, tensor.numel())
+
+    return (tuple(shape), tuple(stride))
+
+
+def _expand_mxfp8_scale_to_3d(scale_tensor: torch.Tensor, batch_size: int):
+    """Expand 2D scale tensor to 3D for cuDNN, similar to FP4's _expand_block_scale_tensor_shape.
+
+    For 2D scales, expand to 3D with batch dimension.
+    This function mirrors FP4's behavior for consistency.
+    """
+    if scale_tensor.ndim == 1:
+        # Swizzled 1D scales: return as-is, will be handled separately
+        return None, None
+
+    shape = list(scale_tensor.shape)
+    stride = list(scale_tensor.stride())
+
+    if len(shape) == 2:
+        # Expand to 3D: insert batch dimension at the beginning
+        shape.insert(0, batch_size)
+        stride.insert(0, 1)
+
+        # Update batch stride similar to FP4's logic
+        # Determine if column-major or row-major
+        is_column_major = stride[-2] == 1  # Check original stride before expansion
+        expand_dim = 2 if is_column_major else 1
+
+        # Calculate batch stride: stride[0] = stride[expand_dim] * shape[expand_dim]
+        stride[0] = stride[expand_dim] * shape[expand_dim]
+
+    return (tuple(shape), tuple(stride))
+
+
 def _get_cudnn_mxfp8_gemm_graph(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -5210,6 +5256,12 @@ def _get_cudnn_mxfp8_gemm_graph(
         f"got {b_descale.ndim}D with shape {b_descale.shape}, dtype={b_descale.dtype}"
     )
 
+    # Expand 2D tensors to 3D for cuDNN (like FP4 does)
+    # cuDNN MXFP8 GEMM only supports 3D batch matrices
+    a_3d_shape, a_3d_stride = _expand_mxfp8_tensor_to_3d(a)
+    b_3d_shape, b_3d_stride = _expand_mxfp8_tensor_to_3d(b)
+    batch_size = a_3d_shape[0]
+
     # Detect if scales are swizzled (1D flattened format)
     # Swizzled scales are typically 1D with size = M_padded * K_padded
     a_swizzled = a_descale.ndim == 1
@@ -5220,7 +5272,7 @@ def _get_cudnn_mxfp8_gemm_graph(
     b_descale_shape = None
     b_descale_stride = None
 
-    # Calculate dimensions
+    # Calculate dimensions from original (non-expanded) shapes
     if len(a.shape) == 3:
         # bmm_mxfp8
         m = a.shape[1]
@@ -5230,7 +5282,7 @@ def _get_cudnn_mxfp8_gemm_graph(
             f"Batch dimension mismatch: a.shape[0]={a.shape[0]}, b.shape[0]={b.shape[0]}"
         )
     else:
-        # mm_mxfp8
+        # mm_mxfp8 - will be expanded to 3D with batch=1
         m = a.shape[0]
         k = a.shape[1]
         n = b.shape[1]
@@ -5239,37 +5291,37 @@ def _get_cudnn_mxfp8_gemm_graph(
         )
 
     if a_swizzled:
-        # Swizzled 1D scale: calculate shape/stride from dimensions
-        a_descale_shape, a_descale_stride = (
+        # Swizzled 1D scale: calculate 2D shape/stride first, then expand to 3D
+        a_descale_2d_shape, a_descale_2d_stride = (
             _calculate_mxfp8_swizzled_scale_shape_stride(
                 a_descale, m, k, block_size, is_transposed=False
             )
         )
-        assert a_descale_shape is not None, (
-            "a_descale_shape should not be None after calculation"
-        )
-        assert a_descale_stride is not None, (
-            "a_descale_stride should not be None after calculation"
-        )
+        # Expand to 3D for cuDNN (batch=1): (m, k//32) -> (batch, m, k//32)
+        a_descale_shape = (batch_size,) + a_descale_2d_shape
+        a_descale_stride = (
+            a_descale_2d_shape[0] * a_descale_2d_stride[0],
+        ) + a_descale_2d_stride
     elif a_descale.ndim == 2:
-        # Non-swizzled 2D scale: extract shape/stride from tensor
-        a_descale_shape = tuple(a_descale.shape)
-        a_descale_stride = tuple(a_descale.stride())
-        # Validate expected dimensions for 2D scale
+        # Non-swizzled 2D scale: expand to 3D for cuDNN
+        a_descale_shape, a_descale_stride = _expand_mxfp8_scale_to_3d(
+            a_descale, batch_size
+        )
+        # Validate expected dimensions
         expected_scale_k = k // block_size
         if len(a.shape) == 3:
-            # bmm_mxfp8: expect (b, m, scale_k) or similar
+            # bmm_mxfp8: expect (b, m, scale_k)
             assert len(a_descale_shape) == 3, (
                 f"a_descale for bmm_mxfp8 should be 3D, got shape {a_descale_shape}"
             )
         else:
-            # mm_mxfp8: expect (m, scale_k)
-            assert len(a_descale_shape) == 2, (
-                f"a_descale for mm_mxfp8 should be 2D, got shape {a_descale_shape}"
+            # mm_mxfp8: expanded from (m, scale_k) to (batch, m, scale_k)
+            assert len(a_descale_shape) == 3, (
+                f"a_descale for mm_mxfp8 should be expanded to 3D, got shape {a_descale_shape}"
             )
-            assert a_descale_shape[1] == expected_scale_k, (
+            assert a_descale_shape[2] == expected_scale_k, (
                 f"a_descale K dimension mismatch: expected {expected_scale_k} (k={k} // block_size={block_size}), "
-                f"got {a_descale_shape[1]}"
+                f"got {a_descale_shape[2]}"
             )
     else:
         raise ValueError(
@@ -5278,40 +5330,40 @@ def _get_cudnn_mxfp8_gemm_graph(
         )
 
     if b_swizzled:
-        # Swizzled 1D scale: calculate shape/stride from dimensions
+        # Swizzled 1D scale: calculate 2D shape/stride first (transposed format), then expand to 3D
         # For b_descale, we need to handle transpose: (K/32, N) format
         # When swizzled, it's flattened from (N_padded, K_padded) then transposed
         # For cuDNN, we need (K_padded, N_padded) with proper stride
-        b_descale_shape, b_descale_stride = (
+        b_descale_2d_shape, b_descale_2d_stride = (
             _calculate_mxfp8_swizzled_scale_shape_stride(
                 b_descale, n, k, block_size, is_transposed=True
             )
         )
-        assert b_descale_shape is not None, (
-            "b_descale_shape should not be None after calculation"
-        )
-        assert b_descale_stride is not None, (
-            "b_descale_stride should not be None after calculation"
-        )
+        # Expand to 3D for cuDNN (batch=1): (k//32, n) -> (batch, k//32, n)
+        b_descale_shape = (batch_size,) + b_descale_2d_shape
+        b_descale_stride = (
+            b_descale_2d_shape[0] * b_descale_2d_stride[0],
+        ) + b_descale_2d_stride
     elif b_descale.ndim == 2:
-        # Non-swizzled 2D scale: extract shape/stride from tensor
-        b_descale_shape = tuple(b_descale.shape)
-        b_descale_stride = tuple(b_descale.stride())
-        # Validate expected dimensions for 2D scale
+        # Non-swizzled 2D scale: expand to 3D for cuDNN
+        b_descale_shape, b_descale_stride = _expand_mxfp8_scale_to_3d(
+            b_descale, batch_size
+        )
+        # Validate expected dimensions
         expected_scale_k = k // block_size
         if len(a.shape) == 3:
-            # bmm_mxfp8: expect (b, scale_k, n) or similar (transposed format)
+            # bmm_mxfp8: expect (b, scale_k, n) - transposed format
             assert len(b_descale_shape) == 3, (
                 f"b_descale for bmm_mxfp8 should be 3D, got shape {b_descale_shape}"
             )
         else:
-            # mm_mxfp8: expect (scale_k, n) - transposed format
-            assert len(b_descale_shape) == 2, (
-                f"b_descale for mm_mxfp8 should be 2D, got shape {b_descale_shape}"
+            # mm_mxfp8: expanded from (scale_k, n) to (batch, scale_k, n)
+            assert len(b_descale_shape) == 3, (
+                f"b_descale for mm_mxfp8 should be expanded to 3D, got shape {b_descale_shape}"
             )
-            assert b_descale_shape[0] == expected_scale_k, (
+            assert b_descale_shape[1] == expected_scale_k, (
                 f"b_descale K dimension mismatch: expected {expected_scale_k} (k={k} // block_size={block_size}), "
-                f"got {b_descale_shape[0]}"
+                f"got {b_descale_shape[1]}"
             )
     else:
         raise ValueError(
@@ -5337,20 +5389,22 @@ def _get_cudnn_mxfp8_gemm_graph(
         f"b_descale.shape={b_descale.shape}, b_swizzled={b_swizzled}"
     )
 
+    # Pass expanded 3D shapes to cuDNN (like FP4 does)
+    # cuDNN MXFP8 GEMM only supports 3D batch matrices
     graph = create_cudnn_execution_plans_mxfp8_gemm(
-        a_shape=a.shape,
-        a_stride=a.stride(),
-        b_shape=b.shape,
-        b_stride=b.stride(),
+        a_shape=a_3d_shape,  # Expanded to 3D (batch=1 for mm_mxfp8)
+        a_stride=a_3d_stride,  # Expanded to 3D
+        b_shape=b_3d_shape,  # Expanded to 3D (batch=1 for mm_mxfp8)
+        b_stride=b_3d_stride,  # Expanded to 3D
         a_type=_torch_data_type_to_cudnn_data_type(a.dtype),
         b_type=_torch_data_type_to_cudnn_data_type(b.dtype),
         o_type=_torch_data_type_to_cudnn_data_type(out_dtype),
         block_size=block_size,
         device=a.device,
-        a_descale_shape=a_descale_shape,
-        a_descale_stride=a_descale_stride,
-        b_descale_shape=b_descale_shape,
-        b_descale_stride=b_descale_stride,
+        a_descale_shape=a_descale_shape,  # Already expanded to 3D
+        a_descale_stride=a_descale_stride,  # Already expanded to 3D
+        b_descale_shape=b_descale_shape,  # Already expanded to 3D
+        b_descale_stride=b_descale_stride,  # Already expanded to 3D
         a_swizzled=a_swizzled,
         b_swizzled=b_swizzled,
     )
