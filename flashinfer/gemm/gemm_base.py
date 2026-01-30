@@ -2415,11 +2415,11 @@ def _check_mm_mxfp8_problem_size(
     if a.ndim != 2 or b.ndim != 2:
         raise ValueError(f"mm_mxfp8 accepts 2d tensors, got {a.shape=} and {b.shape=}")
 
-    # mm_mxfp8 receives b already transposed (shape [n, k]), so we check that
-    # a.shape[1] == b.shape[1] (i.e., k == k) for the matrix multiplication
-    if a.shape[1] != b.shape[1]:
+    # mm_mxfp8 receives b already transposed (shape [k, n]), so we check that
+    # a.shape[1] == b.shape[0] (i.e., k == k) for the matrix multiplication a @ b
+    if a.shape[1] != b.shape[0]:
         raise ValueError(
-            f"K dimension mismatch in mm_mxfp8. got {a.shape[1]=}, {b.shape[1]=}"
+            f"K dimension mismatch in mm_mxfp8. got {a.shape[1]=}, {b.shape[0]=}"
         )
 
     # Input dtype as returned by mxfp8_quantize_sm100
