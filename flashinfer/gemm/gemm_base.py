@@ -2453,6 +2453,11 @@ def _cudnn_gemm_mxfp8_requirement(
     # MXFP8 is only supported with compute capability 10.0 or higher.
     _check_cudnn_availability()
 
+    # Extract dimensions: a is [m, k], b is [k, n] (already transposed)
+    m = a.shape[0]
+    k = a.shape[1]
+    n = b.shape[1]
+
     # Build the mxfp8 cudnn graph to validate support.
     # This graph will be cached & reused in mm_mxfp8() because
     # the graph is constructed with @functools.cache decorator
@@ -2472,14 +2477,32 @@ def _cudnn_gemm_mxfp8_requirement(
         # If graph creation or support check fails, raise informative error
         a_swizzled = a_descale.ndim == 1
         b_swizzled = b_descale.ndim == 1
-        error_msg = (
-            f"cuDNN does not support mm_mxfp8 for this problem size. "
-            f"Shapes: a={a.shape}, b={b.shape}, "
-            f"a_descale.shape={a_descale.shape} ({'swizzled' if a_swizzled else 'non-swizzled'}), "
-            f"b_descale.shape={b_descale.shape} ({'swizzled' if b_swizzled else 'non-swizzled'}), "
-            f"out_dtype={out_dtype}. "
-            f"Original error: {type(e).__name__}: {str(e)}"
+
+        # Check if it's a "no valid engine configs" error (cuDNN size limitation)
+        error_str = str(e)
+        is_size_limitation = "No valid engine configs" in error_str or isinstance(
+            e, (RuntimeError, ValueError)
         )
+
+        if is_size_limitation:
+            error_msg = (
+                f"cuDNN does not support mm_mxfp8 for this problem size (M={m}, N={n}, K={k}). "
+                f"cuDNN MXFP8 GEMM has minimum size requirements that are not met. "
+                f"Shapes: a={a.shape}, b={b.shape}, "
+                f"a_descale.shape={a_descale.shape} ({'swizzled' if a_swizzled else 'non-swizzled'}), "
+                f"b_descale.shape={b_descale.shape} ({'swizzled' if b_swizzled else 'non-swizzled'}), "
+                f"out_dtype={out_dtype}. "
+                f"Original cuDNN error: {type(e).__name__}: {error_str[:500]}"
+            )
+        else:
+            error_msg = (
+                f"cuDNN does not support mm_mxfp8 for this problem size. "
+                f"Shapes: a={a.shape}, b={b.shape}, "
+                f"a_descale.shape={a_descale.shape} ({'swizzled' if a_swizzled else 'non-swizzled'}), "
+                f"b_descale.shape={b_descale.shape} ({'swizzled' if b_swizzled else 'non-swizzled'}), "
+                f"out_dtype={out_dtype}. "
+                f"Original error: {type(e).__name__}: {str(e)}"
+            )
         raise ValueError(error_msg) from e
 
     return True
@@ -4953,6 +4976,13 @@ def create_cudnn_execution_plans_mxfp8_gemm(
     # MXFP8 uses FP8_E8M0 for scale data
     scale_type = cudnn.data_type.FP8_E8M0
 
+    # Determine if scales are swizzled: if a_descale_shape/b_descale_shape were provided
+    # (not None), they came from swizzled 1D tensors. If None, they were calculated
+    # from 2D non-swizzled scales.
+    # F8_128x4 reordering_type should only be used for swizzled scales.
+    a_swizzled = a_descale_shape is not None
+    b_swizzled = b_descale_shape is not None
+
     stream = torch.cuda.current_stream(device)
     with cudnn.graph(_get_cudnn_handle(stream)) as (graph, _):
         a_cudnn_tensor = graph.tensor(
@@ -4967,19 +4997,23 @@ def create_cudnn_execution_plans_mxfp8_gemm(
             stride=tuple(b_stride),  # [k * n, 1, k]
             data_type=b_type,
         )
+        # Conditionally set reordering_type based on whether scales are swizzled
+        a_reordering_type = cudnn.tensor_reordering.F8_128x4 if a_swizzled else None
+        b_reordering_type = cudnn.tensor_reordering.F8_128x4 if b_swizzled else None
+
         block_descale_a_cudnn_tensor = graph.tensor(
             name="block_descale_a",
             dim=a_descale_shape,
             stride=a_descale_stride,
             data_type=scale_type,
-            reordering_type=cudnn.tensor_reordering.F8_128x4,
+            reordering_type=a_reordering_type,
         )
         block_descale_b_cudnn_tensor = graph.tensor(
             name="block_descale_b",
             dim=b_descale_shape,
             stride=b_descale_stride,
             data_type=scale_type,
-            reordering_type=cudnn.tensor_reordering.F8_128x4,
+            reordering_type=b_reordering_type,
         )
 
         # Dequantize the input tensors
@@ -5019,7 +5053,14 @@ def create_cudnn_execution_plans_mxfp8_gemm(
 
         graph.validate()
         graph.build_operation_graph()
-        graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.B])
+        # Note: create_execution_plans may fail for unsupported problem sizes.
+        # We catch this in the requirement check to provide better error messages.
+        try:
+            graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.B])
+        except Exception as e:
+            # If create_execution_plans fails, the graph is still valid but
+            # we need to propagate the error for the requirement check
+            raise e
 
         return graph
 
@@ -5205,6 +5246,7 @@ def mxfp8_gemm_sm100(
     b: torch.Tensor,
     scale_a: torch.Tensor,
     scale_b: torch.Tensor,
+    out_dtype: torch.dtype,
     out: torch.Tensor,
     workspace_buffer: torch.Tensor,
     runner_names: List[str],
@@ -5215,7 +5257,7 @@ def mxfp8_gemm_sm100(
     assert runners, "No suitable runners found"
     tuner = AutoTuner.get()
 
-    inputs = [a, b, scale_a, scale_b, out, workspace_buffer]
+    inputs = [a, b, scale_a, scale_b, out_dtype, out, workspace_buffer]
     runner, tactic = tuner.choose_one(
         "mxfp8_gemm",  # TODO: check if this is correct
         runners,
@@ -5352,5 +5394,5 @@ def bmm_mxfp8(
         "bmm_mxfp8_workspace", DEFAULT_WORKSPACE_SIZE, A.device
     )
 
-    mxfp8_gemm_sm100(A, B, A_scale, B_scale, out, workspace_buffer, ["cudnn"])
+    mxfp8_gemm_sm100(A, B, A_scale, B_scale, dtype, out, workspace_buffer, ["cudnn"])
     return out
