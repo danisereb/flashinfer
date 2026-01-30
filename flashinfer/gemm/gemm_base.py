@@ -5116,8 +5116,17 @@ def create_cudnn_execution_plans_mxfp8_gemm(
         )
 
         # Conditionally set reordering_type based on whether scales are swizzled
-        a_reordering_type = cudnn.tensor_reordering.F8_128x4 if a_swizzled else None
-        b_reordering_type = cudnn.tensor_reordering.F8_128x4 if b_swizzled else None
+        # cuDNN requires a tensor_reordering enum, not None
+        a_reordering_type = (
+            cudnn.tensor_reordering.F8_128x4
+            if a_swizzled
+            else cudnn.tensor_reordering.NONE
+        )
+        b_reordering_type = (
+            cudnn.tensor_reordering.F8_128x4
+            if b_swizzled
+            else cudnn.tensor_reordering.NONE
+        )
 
         block_descale_a_cudnn_tensor = graph.tensor(
             name="block_descale_a",
