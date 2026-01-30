@@ -2468,9 +2468,19 @@ def _cudnn_gemm_mxfp8_requirement(
             tactic=-1,
         )
         graph.check_support()
-    except Exception:
-        # If graph creation or support check fails, this configuration is not supported
-        return False
+    except Exception as e:
+        # If graph creation or support check fails, raise informative error
+        a_swizzled = a_descale.ndim == 1
+        b_swizzled = b_descale.ndim == 1
+        error_msg = (
+            f"cuDNN does not support mm_mxfp8 for this problem size. "
+            f"Shapes: a={a.shape}, b={b.shape}, "
+            f"a_descale.shape={a_descale.shape} ({'swizzled' if a_swizzled else 'non-swizzled'}), "
+            f"b_descale.shape={b_descale.shape} ({'swizzled' if b_swizzled else 'non-swizzled'}), "
+            f"out_dtype={out_dtype}. "
+            f"Original error: {type(e).__name__}: {str(e)}"
+        )
+        raise ValueError(error_msg) from e
 
     return True
 
