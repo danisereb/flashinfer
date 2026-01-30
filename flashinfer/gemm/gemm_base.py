@@ -2449,8 +2449,27 @@ def _cudnn_gemm_mxfp8_requirement(
     backend: Literal["cudnn"] = "cudnn",
 ) -> bool:
     # MXFP8 is only supported with compute capability 10.0 or higher.
+    _check_cudnn_availability()
 
-    # TODO: implement this
+    # Build the mxfp8 cudnn graph to validate support.
+    # This graph will be cached & reused in mm_mxfp8() because
+    # the graph is constructed with @functools.cache decorator
+    try:
+        graph = _get_cudnn_mxfp8_gemm_graph(
+            a=a,
+            b=b,
+            a_descale=a_descale,
+            b_descale=b_descale,
+            out_dtype=out_dtype,
+            out=out,
+            block_size=32,
+            tactic=-1,
+        )
+        graph.check_support()
+    except Exception:
+        # If graph creation or support check fails, this configuration is not supported
+        return False
+
     return True
 
 
