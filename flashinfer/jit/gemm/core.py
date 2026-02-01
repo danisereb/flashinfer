@@ -276,7 +276,6 @@ def gen_gemm_sm100_module_cutlass_mxfp8() -> JitSpec:
         extra_cuda_cflags=nvcc_flags
         + [
             "-DENABLE_BF16",
-            "-DENABLE_FP4",  # TODO: -DENABLE_MXFP8? probably no need for this flag
         ],
         extra_cflags=[
             "-DFAST_BUILD",
