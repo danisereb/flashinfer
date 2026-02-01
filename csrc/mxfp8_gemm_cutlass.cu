@@ -83,8 +83,8 @@ void runGemm(TensorView out, TensorView mat1, TensorView mat2, TensorView mat1Sc
   }
 }
 
-constexpr auto FLOAT8_E4M3FN = dl_uint8;  // uint8_t // TODO: check
-constexpr auto SF_DTYPE = dl_uint8;       // uint8_t
+constexpr auto FLOAT8_E4M3FN = dl_float8_e4m3fn;  // float8_e4m3fn
+constexpr auto SF_DTYPE = dl_uint8;               // uint8_t
 
 // TODO: check all comments below
 // mat1: [B, M, K], FLOAT8_E4M3FN
