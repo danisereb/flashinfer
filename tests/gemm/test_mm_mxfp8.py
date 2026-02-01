@@ -13,7 +13,7 @@ from flashinfer.utils import get_compute_capability
 @pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16])
-@pytest.mark.parametrize("backend", ["cudnn"])
+@pytest.mark.parametrize("backend", ["cutlass"])
 @pytest.mark.parametrize("auto_tuning", [True, False])
 def test_mm_mxfp8(
     m, n, k, input_dtype, is_sf_swizzled_layout, out_dtype, backend, auto_tuning
