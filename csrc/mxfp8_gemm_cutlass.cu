@@ -171,7 +171,7 @@ void mxfp8_bmm_impl(TensorView mat1, TensorView mat2, TensorView mat1Scale, Tens
 
 void mxfp8_gemm(TensorView mat1, TensorView mat2, TensorView mat1Scale, TensorView mat2Scale,
                 TensorView out, TensorView workspace_buffer, int64_t tactic) {
-  mxfp8_bmm_impl(mat1, mat2, mat1Scale, mat2Scale, globalScale, out, workspace_buffer, tactic);
+  mxfp8_bmm_impl(mat1, mat2, mat1Scale, mat2Scale, out, workspace_buffer, tactic);
 }
 
 int64_t mxfp8_gemm_tactic_num() {
