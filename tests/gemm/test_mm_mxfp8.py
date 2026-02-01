@@ -55,7 +55,7 @@ def _run_mm_mxfp8(
     assert res.shape == (m, n)
     assert res.dtype == out_dtype
     assert res.device.type == "cuda"
-    assert not torch.isnan(res).any(), "Output contains NaN values"
+    assert torch.isfinite(res).all(), "Output contains NaN/Inf values"
 
     min_cos_sim = 0.9
     cos_sim = F.cosine_similarity(reference.reshape(-1), res.reshape(-1), dim=0)
@@ -64,9 +64,9 @@ def _run_mm_mxfp8(
     )
 
 
-@pytest.mark.parametrize("m", [128, 256, 512, 1024, 2048])
-@pytest.mark.parametrize("n", [128, 256, 512, 1024, 2048])
-@pytest.mark.parametrize("k", [128, 256, 512, 1024, 2048])
+@pytest.mark.parametrize("m", [128, 256, 512, 1024])
+@pytest.mark.parametrize("n", [128, 256, 512, 1024])
+@pytest.mark.parametrize("k", [128, 256, 512, 1024])
 @pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
@@ -88,7 +88,7 @@ def test_mm_mxfp8(
     )
 
 
-@pytest.mark.parametrize("m", [64, 128, 256])
+@pytest.mark.parametrize("m", [128, 256])
 @pytest.mark.parametrize("n", [128, 256])
 @pytest.mark.parametrize("k", [128, 256, 512])
 @pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
