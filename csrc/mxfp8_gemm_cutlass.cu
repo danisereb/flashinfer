@@ -86,14 +86,11 @@ void runGemm(TensorView out, TensorView mat1, TensorView mat2, TensorView mat1Sc
 constexpr auto FLOAT8_E4M3FN = dl_float8_e4m3fn;  // float8_e4m3fn
 constexpr auto SF_DTYPE = dl_uint8;               // uint8_t
 
-// TODO: check all comments below
 // mat1: [B, M, K], FLOAT8_E4M3FN
-// mat2: [B, N, K], FLOAT8_E4M3FN
-// out: [B, M, N], fp16/bf16/fp32
-// mat1Scale: ceil(M / 128) * 128 * ceil(K / sfVecSize / 4) * 4, SF_DTYPE (UE8M0)
-// mat2Scale: ceil(N / 128) * 128 * ceil(K / sfVecSize / 4) * 4, SF_DTYPE (UE8M0)
+// mat2: [B, N, K], FLOAT8_E4M3FN (passed as transposed, TensorView sees [N, K])
+// out: [B, M, N], fp16/bf16
+// mat1Scale/mat2Scale: SF_DTYPE (UE8M0), sfVecSize is always 32
 // B = 1 for GEMM op as a special case
-// sfVecSize is always 32
 void mxfp8_bmm_impl(TensorView mat1, TensorView mat2, TensorView mat1Scale, TensorView mat2Scale,
                     TensorView out, TensorView workspace_buffer, int64_t tactic) {
   CHECK_INPUT_AND_TYPE(mat1, FLOAT8_E4M3FN);

@@ -22,9 +22,7 @@ def _run_mm_mxfp8(
     if compute_capability[0] in [11, 12]:
         pytest.skip("Not tested on SM110/SM120/SM121")
     if compute_capability[0] < 10:
-        pytest.skip(
-            "mm_mxfp8 with cudnn backend is only supported on SM100 and above GPUs."
-        )
+        pytest.skip("mm_mxfp8 is only supported on SM100 and above GPUs.")
 
     input = torch.randn([m, k], device="cuda", dtype=input_dtype)
     mat2 = torch.randn([n, k], device="cuda", dtype=input_dtype)
