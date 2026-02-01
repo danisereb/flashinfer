@@ -104,7 +104,7 @@ size_t genericMxfp8GemmKernelLauncher(void* D, void const* A, void const* B, voi
     using CTAShape = cute::Shape<cute::Int<CTA_M_>, cute::Int<CTA_N_>, cute::Int<CTA_K_>>;                     \
     /*using ClusterShape = cute::Shape<cute::Int<CGA_M_>, cute::Int<CGA_N_>, cute::Int<CGA_K_>>;*/             \
     using ClusterShape = cute::Shape<int, int, _1>;                                                            \
-    using ElementType = cutlass::float_e2m1_t;                                                                 \
+    using ElementType = cutlass::float_e4m3_t;                                                                 \
     using Arch = cutlass::arch::Sm100;                                                                         \
     /* // Input A */                                                                                           \
     using ElementA = ElementType;                                                                              \
@@ -119,7 +119,7 @@ size_t genericMxfp8GemmKernelLauncher(void* D, void const* A, void const* B, voi
     using LayoutC = cutlass::layout::RowMajor;                                                                 \
     static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<OutElementType>::value;                       \
                                                                                                                \
-    using SFType = cutlass::float_ue4m3_t;                                                                     \
+    using SFType = cutlass::float_ue8m0_t;                                                                     \
     using ElementCompute = float;                                                                              \
     using ElementAccumulator = float;                                                                          \
     using OperatorClass = cutlass::arch::OpClassTensorOp;                                                      \
@@ -178,8 +178,8 @@ size_t genericMxfp8GemmKernelLauncher(void* D, void const* A, void const* B, voi
         typename Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;                                   \
     using ElementA = typename Gemm::ElementA;                                                                  \
     using ElementB = typename Gemm::ElementB;                                                                  \
-    using ElementSFA = cutlass::float_ue4m3_t;                                                                 \
-    using ElementSFB = cutlass::float_ue4m3_t;                                                                 \
+    using ElementSFA = cutlass::float_ue8m0_t;                                                                 \
+    using ElementSFB = cutlass::float_ue8m0_t;                                                                 \
     using ElementC = void;                                                                                     \
     using ElementD = typename Gemm::ElementD;                                                                  \
     using ElementCompute = float;                                                                              \
