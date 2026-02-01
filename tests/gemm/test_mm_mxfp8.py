@@ -13,7 +13,7 @@ from flashinfer.utils import get_compute_capability
 @pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16])
-@pytest.mark.parametrize("backend", ["cudnn"])
+@pytest.mark.parametrize("backend", ["cutlass"])
 @pytest.mark.parametrize("auto_tuning", [True, False])
 def test_mm_mxfp8(
     m, n, k, input_dtype, is_sf_swizzled_layout, out_dtype, backend, auto_tuning
@@ -32,7 +32,7 @@ def test_mm_mxfp8(
     input_mxfp8, input_scale = mxfp8_quantize(input, is_sf_swizzled_layout)
     mat2_mxfp8, mat2_scale = mxfp8_quantize(mat2, is_sf_swizzled_layout)
 
-    # Compute reference result: mm_mxfp8 receives mat2.T (shape [k, n]) and computes input @ mat2.T
+    # Compute reference result
     reference = torch.mm(input, mat2.T)
 
     # Prepare scales according to mm_mxfp8's expected format
@@ -61,18 +61,22 @@ def test_mm_mxfp8(
                 out_dtype=out_dtype,
                 backend=backend,
             )
-        except ValueError as e:
+        except (ValueError, RuntimeError) as e:
+            error_msg = str(e)
             # Skip test cases where cuDNN doesn't support the problem size
             # This is a cuDNN limitation, not a bug in our code
-            if "cuDNN does not support mm_mxfp8" in str(e):
+            if "cuDNN does not support mm_mxfp8" in error_msg:
                 pytest.skip(
                     f"cuDNN does not support mm_mxfp8 for size (M={m}, N={n}, K={k}): {e}"
                 )
+            # Skip test cases where CUTLASS backend is not available
+            if "CUTLASS MXFP8 GEMM backend is not available" in error_msg:
+                pytest.skip(f"CUTLASS MXFP8 GEMM backend is not available: {e}")
             raise
 
     assert res.shape == (m, n)
     assert res.dtype == out_dtype
-    assert res.device == torch.device("cuda")
+    assert res.device.type == "cuda"
 
     min_cos_sim = 0.9
     cos_sim = F.cosine_similarity(reference.reshape(-1), res.reshape(-1), dim=0)

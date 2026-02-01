@@ -53,6 +53,7 @@ from ..jit.gemm import gen_gemm_sm120_module
 from ..jit.gemm import gen_gemm_sm120_module_cutlass_fp4
 from ..jit.gemm import gen_gemm_sm100_module_cutlass_fp4
 from ..jit.gemm import gen_gemm_sm100_module_cutlass_fp8
+from ..jit.gemm import gen_gemm_sm100_module_cutlass_mxfp8
 from ..jit.gemm import gen_gemm_sm100_module_cutlass_bf16
 from ..jit.gemm import gen_trtllm_gen_gemm_module
 from ..jit.gemm import gen_tgv_gemm_sm10x_module
@@ -2401,6 +2402,80 @@ def mm_fp8(
     return out
 
 
+def _create_cutlass_mxfp8_gemm_module(module, op_name: str, tuner_name: str):
+    """Helper function to create cutlass MXFP8 GEMM module."""
+
+    def cutlass_mxfp8_gemm_runner():
+        class CutlassMxfp8GemmRunner(TunableRunner):
+            def __init__(self):
+                # TODO: is this even used?
+                # maybe use in the forward() below
+                self._mxfp8_gemm_runner = module.mxfp8_gemm
+
+            def get_valid_tactics(
+                self,
+                inputs: List[torch.Tensor],
+                profile: OptimizationProfile,
+            ) -> List[int]:
+                # TODO: add mxfp8_gemm_tactic_num
+                return list(range(module.mxfp8_gemm_tactic_num()))
+
+            def forward(
+                self,
+                inputs: List[torch.Tensor],
+                tactic: int = -1,
+                do_preparation: bool = False,
+                **kwargs,
+            ):
+                # Input from mm_mxfp8
+                (
+                    a,
+                    b,
+                    a_descale,
+                    b_descale,
+                    _,
+                    out,
+                    workspace_buffer,
+                ) = inputs
+
+                # TODO: remove commented code if not required
+                # if a.dtype == torch.float8_e4m3fn and a_descale.dtype == torch.uint8:
+                #    a_descale = a_descale.view(torch.uint8)
+
+                # if b.dtype == torch.float8_e4m3fn and b_descale.dtype == torch.uint8:
+                #    b_descale = b_descale.view(torch.uint8)
+
+                # TODO: add mxfp8_gemm CUDA
+                module.mxfp8_gemm(
+                    a, b.T, a_descale, b_descale.T, out, workspace_buffer, tactic
+                )
+                return out
+
+        return CutlassMxfp8GemmRunner()
+
+    return SimpleNamespace(
+        cutlass_mxfp8_gemm_runner=cutlass_mxfp8_gemm_runner,
+    )
+
+
+@functools.cache
+def get_gemm_sm100_module_cutlass_mxfp8():
+    """Get the SM100/103/110 MXFP8 GEMM module."""
+    module = gen_gemm_sm100_module_cutlass_mxfp8().build_and_load()
+    return _create_cutlass_mxfp8_gemm_module(
+        module, "flashinfer::cutlass_mxfp8_gemm", "cutlass_mxfp8_gemm"
+    )
+
+
+def get_cutlass_mxfp8_gemm_module(
+    sm_major: int,
+):
+    if sm_major in [10, 11]:
+        return get_gemm_sm100_module_cutlass_mxfp8()
+    else:
+        raise ValueError(f"Unsupported SM major version: {sm_major}")
+
+
 def _check_mm_mxfp8_problem_size(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -2440,7 +2515,7 @@ def _check_mm_mxfp8_problem_size(
     return True
 
 
-@supported_compute_capability([100, 103, 110, 120, 121])
+@supported_compute_capability([100, 103, 110])
 def _cudnn_gemm_mxfp8_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -2547,6 +2622,19 @@ def _cudnn_gemm_mxfp8_requirement(
     return True
 
 
+@supported_compute_capability([100, 103, 110])
+def _cutlass_gemm_mxfp8_requirement(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_descale: torch.Tensor,
+    b_descale: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    backend: Literal["cudnn", "cutlass", "auto"] = "auto",
+):
+    return True
+
+
 def _heuristic_func_mm_mxfp8(
     suitable_backends: List[str],
     a: torch.Tensor,
@@ -2565,6 +2653,7 @@ def _heuristic_func_mm_mxfp8(
 @backend_requirement(
     {
         "cudnn": _cudnn_gemm_mxfp8_requirement,
+        "cutlass": _cutlass_gemm_mxfp8_requirement,
     },
     common_check=_check_mm_mxfp8_problem_size,
     heuristic_func=_heuristic_func_mm_mxfp8,  # result stored in mm_mxfp8.suitable_auto_backends
@@ -2576,7 +2665,7 @@ def mm_mxfp8(
     b_descale: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
-    backend: Literal["cudnn"] = "cudnn",
+    backend: Literal["cudnn", "cutlass", "auto"] = "auto",
 ) -> torch.Tensor:
     r"""MM MXFP8 (block size 32)
 
@@ -2594,6 +2683,7 @@ def mm_mxfp8(
         - 1D swizzled: shape (M_padded * K_padded,) where M_padded = round_up(m, 128), K_padded = round_up(k // 32, 4)
         dtype: float8_e4m3fn or uint8.
 
+    # TODO: check maybe we need (n, k // 32)
     b_descale: torch.Tensor
         Block scale tensor for B. Can be:
         - 2D non-swizzled: shape (k // 32, n) - transposed format
@@ -2684,11 +2774,18 @@ def mm_mxfp8(
     else:
         backends = [backend]
 
+    major, _ = get_compute_capability(a.device)
+
     backend_to_runner_factory = {
         "cudnn": lambda: _cudnn_gemm_mxfp8_runner(),
+        "cutlass": lambda: get_cutlass_mxfp8_gemm_module(
+            major
+        ).cutlass_mxfp8_gemm_runner(),
     }
 
-    runners = [backend_to_runner_factory[cur_backend]() for cur_backend in backends]
+    runners: List[TunableRunner] = [
+        backend_to_runner_factory[cur_backend]() for cur_backend in backends
+    ]
 
     # Now we have a list of runners for desired & supported backends.
     tuner = AutoTuner.get()
@@ -2707,10 +2804,10 @@ def mm_mxfp8(
     ]
 
     runner, tactic = tuner.choose_one(
-        "mxfp8_gemm",
-        runners,
-        tuning_config,
-        inputs,
+        custom_op="mxfp8_gemm",
+        runners=runners,
+        tuning_config=tuning_config,
+        inputs=inputs,
     )
 
     runner(inputs=inputs, tactic=tactic)
