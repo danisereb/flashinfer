@@ -113,9 +113,9 @@ void mxfp8_bmm_impl(TensorView mat1, TensorView mat2, TensorView mat1Scale, Tens
     TVM_FFI_ICHECK_EQ(mat1.size(1), mat2.size(0) * mat2_k_scale)
         << "mat1 and mat2 shapes cannot be multiplied (" << mat1.size(0) << "x" << mat1.size(1)
         << " and " << mat2.size(0) << "x" << mat2.size(1) << ")";
-    m = mat1.size(0);
-    n = mat2.size(1);  // mat2 is [K, N], so N is size(1)
-    k = mat2.size(0);  // mat2 is [K, N], so K is size(0)
+    m = mat1.size(0);  // mat1 is [M, K]
+    n = mat2.size(1);  // mat2 is [K, N]
+    k = mat2.size(0);
     b = 1;
   } else if (mat1.ndim() == 3) {
     TVM_FFI_ICHECK_EQ(mat2.ndim(), 3) << "mat2 must be a batch of matrices";
@@ -127,9 +127,9 @@ void mxfp8_bmm_impl(TensorView mat1, TensorView mat2, TensorView mat1Scale, Tens
     TVM_FFI_ICHECK_EQ(mat1.size(2), mat2.size(1) * mat2_k_scale)
         << "mat1 and mat2 shapes cannot be multiplied (" << mat1.size(1) << "x" << mat1.size(2)
         << " and " << mat2.size(1) << "x" << mat2.size(2) << ")";
-    m = mat1.size(1);
-    n = mat2.size(2);  // mat2 is [B, K, N], so N is size(2)
-    k = mat2.size(1);  // mat2 is [B, K, N], so K is size(1)
+    m = mat1.size(1);  // mat1 is [B, M, K]
+    n = mat2.size(2);  // mat2 is [B, K, N]
+    k = mat2.size(1);
     b = mat1.size(0);
   } else {
     TVM_FFI_LOG_AND_THROW(NotImplementedError) << "mat1 must be a matrix or a batch of matrices";
