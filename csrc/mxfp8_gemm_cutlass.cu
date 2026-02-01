@@ -107,29 +107,29 @@ void mxfp8_bmm_impl(TensorView mat1, TensorView mat2, TensorView mat1Scale, Tens
   int64_t m, n, k, b;
   if (mat1.ndim() == 2) {
     TVM_FFI_ICHECK_EQ(mat2.ndim(), 2) << "mat2 must be a matrix";
-    // mat2 is passed as b.T, so it's [K, N] (transposed from [N, K])
+    // mat2 is passed as b.T, but TensorView reads underlying storage as [N, K]
     // mat1 is [M, K]
-    // Check: mat1.size(1) == mat2.size(0) (both should be K)
-    TVM_FFI_ICHECK_EQ(mat1.size(1), mat2.size(0) * mat2_k_scale)
+    // Check: mat1.size(1) == mat2.size(1) (both should be K)
+    TVM_FFI_ICHECK_EQ(mat1.size(1), mat2.size(1) * mat2_k_scale)
         << "mat1 and mat2 shapes cannot be multiplied (" << mat1.size(0) << "x" << mat1.size(1)
         << " and " << mat2.size(0) << "x" << mat2.size(1) << ")";
-    m = mat1.size(0);  // mat1 is [M, K]
-    n = mat2.size(1);  // mat2 is [K, N]
-    k = mat2.size(0);
+    m = mat1.size(0);
+    n = mat2.size(0);  // mat2 is [N, K] in storage
+    k = mat2.size(1);  // mat2 is [N, K] in storage
     b = 1;
   } else if (mat1.ndim() == 3) {
     TVM_FFI_ICHECK_EQ(mat2.ndim(), 3) << "mat2 must be a batch of matrices";
     TVM_FFI_ICHECK_EQ(mat1.size(0), mat2.size(0)) << "mat1 and mat2 must have the same batch size ("
                                                   << mat1.size(0) << " and " << mat2.size(0) << ")";
-    // mat2 is passed as b.T, so it's [B, K, N] (transposed from [B, N, K])
+    // mat2 is passed as b.T, but TensorView reads underlying storage as [B, N, K]
     // mat1 is [B, M, K]
-    // Check: mat1.size(2) == mat2.size(1) (both should be K)
-    TVM_FFI_ICHECK_EQ(mat1.size(2), mat2.size(1) * mat2_k_scale)
+    // Check: mat1.size(2) == mat2.size(2) (both should be K)
+    TVM_FFI_ICHECK_EQ(mat1.size(2), mat2.size(2) * mat2_k_scale)
         << "mat1 and mat2 shapes cannot be multiplied (" << mat1.size(1) << "x" << mat1.size(2)
         << " and " << mat2.size(1) << "x" << mat2.size(2) << ")";
-    m = mat1.size(1);  // mat1 is [B, M, K]
-    n = mat2.size(2);  // mat2 is [B, K, N]
-    k = mat2.size(1);
+    m = mat1.size(1);
+    n = mat2.size(1);  // mat2 is [B, N, K] in storage
+    k = mat2.size(2);  // mat2 is [B, N, K] in storage
     b = mat1.size(0);
   } else {
     TVM_FFI_LOG_AND_THROW(NotImplementedError) << "mat1 must be a matrix or a batch of matrices";
