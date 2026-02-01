@@ -76,7 +76,7 @@ def test_mm_mxfp8(
 
     assert res.shape == (m, n)
     assert res.dtype == out_dtype
-    assert res.device == torch.device("cuda")
+    assert res.device.type == "cuda"
 
     min_cos_sim = 0.9
     cos_sim = F.cosine_similarity(reference.reshape(-1), res.reshape(-1), dim=0)
