@@ -112,7 +112,7 @@ void mxfp8_bmm_impl(TensorView mat1, TensorView mat2, TensorView mat1Scale, Tens
         << " and " << mat2.size(0) << "x" << mat2.size(1) << ")";
     m = mat1.size(0);
     n = mat2.size(0);
-    k = mat2.size(1) * 2;
+    k = mat2.size(1);
     b = 1;
   } else if (mat1.ndim() == 3) {
     TVM_FFI_ICHECK_EQ(mat2.ndim(), 3) << "mat2 must be a batch of matrices";
@@ -123,7 +123,7 @@ void mxfp8_bmm_impl(TensorView mat1, TensorView mat2, TensorView mat1Scale, Tens
         << " and " << mat2.size(1) << "x" << mat2.size(2) << ")";
     m = mat1.size(1);
     n = mat2.size(1);
-    k = mat2.size(2) * 2;
+    k = mat2.size(2);
     b = mat1.size(0);
   } else {
     TVM_FFI_LOG_AND_THROW(NotImplementedError) << "mat1 must be a matrix or a batch of matrices";
