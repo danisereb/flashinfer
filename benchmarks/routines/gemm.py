@@ -1321,7 +1321,7 @@ def testMmMxfp8(args):
         print(f"[VVERBOSE] {mat2_scale.dtype = }")
 
     def run_backend(backend, input_mxfp8, mat2_mxfp8, input_scale, mat2_scale):
-        if backend == "cudnn":
+        if backend == "cutlass":
             return flashinfer.gemm.mm_mxfp8(
                 a=input_mxfp8,
                 b=mat2_mxfp8.t(),  # mm_mxfp8 expects b.t()
