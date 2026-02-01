@@ -303,8 +303,8 @@ routine_cc_to_supported_backends = {
         "8.6": [],
         "8.9": [],
         "9.0": [],
-        "10.0": ["cudnn"],
-        "10.3": ["cudnn"],
+        "10.0": ["cutlass"],
+        "10.3": ["cutlass"],
         "12.0": [],
     },
     # Note: mm_fp4 uses support checkers to filter backends, so it is not listed here
