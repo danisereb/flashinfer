@@ -32,7 +32,7 @@ def test_mm_mxfp8(
     input_mxfp8, input_scale = mxfp8_quantize(input, is_sf_swizzled_layout)
     mat2_mxfp8, mat2_scale = mxfp8_quantize(mat2, is_sf_swizzled_layout)
 
-    # Compute reference result: mm_mxfp8 receives mat2.T (shape [k, n]) and computes input @ mat2.T
+    # Compute reference result
     reference = torch.mm(input, mat2.T)
 
     # Prepare scales according to mm_mxfp8's expected format
