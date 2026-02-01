@@ -61,13 +61,17 @@ def test_mm_mxfp8(
                 out_dtype=out_dtype,
                 backend=backend,
             )
-        except ValueError as e:
+        except (ValueError, RuntimeError) as e:
+            error_msg = str(e)
             # Skip test cases where cuDNN doesn't support the problem size
             # This is a cuDNN limitation, not a bug in our code
-            if "cuDNN does not support mm_mxfp8" in str(e):
+            if "cuDNN does not support mm_mxfp8" in error_msg:
                 pytest.skip(
                     f"cuDNN does not support mm_mxfp8 for size (M={m}, N={n}, K={k}): {e}"
                 )
+            # Skip test cases where CUTLASS backend is not available
+            if "CUTLASS MXFP8 GEMM backend is not available" in error_msg:
+                pytest.skip(f"CUTLASS MXFP8 GEMM backend is not available: {e}")
             raise
 
     assert res.shape == (m, n)

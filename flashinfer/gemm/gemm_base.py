@@ -53,6 +53,7 @@ from ..jit.gemm import gen_gemm_sm120_module
 from ..jit.gemm import gen_gemm_sm120_module_cutlass_fp4
 from ..jit.gemm import gen_gemm_sm100_module_cutlass_fp4
 from ..jit.gemm import gen_gemm_sm100_module_cutlass_fp8
+from ..jit.gemm import gen_gemm_sm100_module_cutlass_mxfp8
 from ..jit.gemm import gen_gemm_sm100_module_cutlass_bf16
 from ..jit.gemm import gen_trtllm_gen_gemm_module
 from ..jit.gemm import gen_tgv_gemm_sm10x_module
@@ -2460,7 +2461,7 @@ def _create_cutlass_mxfp8_gemm_module(module, op_name: str, tuner_name: str):
 @functools.cache
 def get_gemm_sm100_module_cutlass_mxfp8():
     """Get the SM100/103/110 MXFP8 GEMM module."""
-    module = gen_gemm_sm100_module_cutlass_fp4().build_and_load()
+    module = gen_gemm_sm100_module_cutlass_mxfp8().build_and_load()
     return _create_cutlass_mxfp8_gemm_module(
         module, "flashinfer::cutlass_mxfp8_gemm", "cutlass_mxfp8_gemm"
     )
