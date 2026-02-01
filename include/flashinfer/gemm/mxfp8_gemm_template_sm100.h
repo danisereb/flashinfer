@@ -56,7 +56,7 @@ struct SMTypeAdapter<_1SM> {
   static int const Scale = 1;
   using AtomThrShape = cute::Shape<_1, _1, _1>;
   using EpilogueSchedule = cutlass::epilogue::TmaWarpSpecialized1Sm;
-  using MainloopSchedule = cutlass::gemm::KernelTmaWarpSpecialized1SmNvf4Sm100;
+  using MainloopSchedule = cutlass::gemm::KernelTmaWarpSpecialized1SmMxf8f6f4Sm100;
 };
 
 template <>
@@ -64,7 +64,7 @@ struct SMTypeAdapter<_2SM> {
   static int const Scale = 2;
   using AtomThrShape = cute::Shape<_2, _1, _1>;
   using EpilogueSchedule = cutlass::epilogue::TmaWarpSpecialized2Sm;
-  using MainloopSchedule = cutlass::gemm::KernelTmaWarpSpecialized2SmNvf4Sm100;
+  using MainloopSchedule = cutlass::gemm::KernelTmaWarpSpecialized2SmMxf8f6f4Sm100;
 };
 
 template <typename>
