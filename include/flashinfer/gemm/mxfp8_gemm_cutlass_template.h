@@ -214,13 +214,16 @@ std::vector<CutlassGemmConfig> CutlassMxfp8GemmRunner<T, mxfp8GemmType>::getConf
   }
 
   // There’s no heuristic yet, so for users without autotuning, we provide an ordering based on
-  // performance sweeps from common workloads.
+  // performance sweeps from common workloads. Keep it safe if configs are pruned.
   std::vector<int64_t> best_tactics_index = {22, 20, 29, 4, 18};
   std::vector<CutlassGemmConfig> newCandidateConfigs;
+  newCandidateConfigs.reserve(candidateConfigs.size());
   for (auto const& tactic_index : best_tactics_index) {
-    newCandidateConfigs.push_back(candidateConfigs[tactic_index]);
+    if (tactic_index >= 0 && tactic_index < static_cast<int64_t>(candidateConfigs.size())) {
+      newCandidateConfigs.push_back(candidateConfigs[tactic_index]);
+    }
   }
-  for (int64_t i = 0; i < candidateConfigs.size(); i++) {
+  for (int64_t i = 0; i < static_cast<int64_t>(candidateConfigs.size()); i++) {
     if (std::find(best_tactics_index.begin(), best_tactics_index.end(), i) ==
         best_tactics_index.end()) {
       newCandidateConfigs.push_back(candidateConfigs[i]);
