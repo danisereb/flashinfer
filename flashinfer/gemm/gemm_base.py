@@ -2483,7 +2483,7 @@ def _check_mm_mxfp8_problem_size(
     b_descale: torch.Tensor,
     out: Optional[torch.Tensor] = None,  # unused
     out_dtype: torch.dtype = torch.bfloat16,
-    backend: Literal["cudnn"] = "cudnn",  # unused
+    backend: Literal["cutlass", "auto"] = "auto",  # unused
 ) -> bool:
     # Generic checks
     ## pre-check the input tensors and block scale tensors
@@ -2516,113 +2516,6 @@ def _check_mm_mxfp8_problem_size(
 
 
 @supported_compute_capability([100, 103, 110])
-def _cudnn_gemm_mxfp8_requirement(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    a_descale: torch.Tensor,
-    b_descale: torch.Tensor,
-    out: Optional[torch.Tensor] = None,
-    out_dtype: torch.dtype = torch.bfloat16,
-    backend: Literal["cudnn"] = "cudnn",
-) -> bool:
-    # MXFP8 is only supported with compute capability 10.0 or higher.
-    _check_cudnn_availability()
-
-    # Extract dimensions: a is [m, k], b is [k, n] (already transposed)
-    m = a.shape[0]
-    k = a.shape[1]
-    n = b.shape[1]
-
-    # Build the mxfp8 cudnn graph to validate support.
-    # This graph will be cached & reused in mm_mxfp8() because
-    # the graph is constructed with @functools.cache decorator
-    try:
-        graph = _get_cudnn_mxfp8_gemm_graph(
-            a=a,
-            b=b,
-            a_descale=a_descale,
-            b_descale=b_descale,
-            out_dtype=out_dtype,
-            out=out,
-            block_size=32,
-            tactic=-1,
-        )
-        graph.check_support()
-    except Exception as e:
-        # If graph creation or support check fails, raise informative error
-        a_swizzled = a_descale.ndim == 1
-        b_swizzled = b_descale.ndim == 1
-
-        # Try to extract calculated shapes/strides for debugging
-        debug_info = []
-        try:
-            # Calculate what shapes/strides would be used
-            block_size = 32
-            if a_swizzled:
-                a_calc_shape, a_calc_stride = (
-                    _calculate_mxfp8_swizzled_scale_shape_stride(
-                        a_descale, m, k, block_size, is_transposed=False
-                    )
-                )
-                debug_info.append(
-                    f"a_descale_calculated_shape={a_calc_shape}, stride={a_calc_stride}"
-                )
-            elif a_descale.ndim == 2:
-                debug_info.append(
-                    f"a_descale_shape={a_descale.shape}, stride={a_descale.stride()}"
-                )
-
-            if b_swizzled:
-                b_calc_shape, b_calc_stride = (
-                    _calculate_mxfp8_swizzled_scale_shape_stride(
-                        b_descale, n, k, block_size, is_transposed=True
-                    )
-                )
-                debug_info.append(
-                    f"b_descale_calculated_shape={b_calc_shape}, stride={b_calc_stride}"
-                )
-            elif b_descale.ndim == 2:
-                debug_info.append(
-                    f"b_descale_shape={b_descale.shape}, stride={b_descale.stride()}"
-                )
-        except Exception as calc_e:
-            debug_info.append(f"(Could not calculate shapes: {calc_e})")
-
-        # Check if it's a "no valid engine configs" error (cuDNN size limitation)
-        error_str = str(e)
-        is_size_limitation = "No valid engine configs" in error_str or isinstance(
-            e, (RuntimeError, ValueError)
-        )
-
-        debug_str = " | ".join(debug_info) if debug_info else ""
-
-        if is_size_limitation:
-            error_msg = (
-                f"cuDNN does not support mm_mxfp8 for this problem size (M={m}, N={n}, K={k}). "
-                f"cuDNN MXFP8 GEMM has minimum size requirements that are not met. "
-                f"Shapes: a={a.shape}, b={b.shape}, "
-                f"a_descale.shape={a_descale.shape} ({'swizzled' if a_swizzled else 'non-swizzled'}), "
-                f"b_descale.shape={b_descale.shape} ({'swizzled' if b_swizzled else 'non-swizzled'}), "
-                f"out_dtype={out_dtype}. "
-                f"{debug_str}. "
-                f"Original cuDNN error: {type(e).__name__}: {error_str[:500]}"
-            )
-        else:
-            error_msg = (
-                f"cuDNN does not support mm_mxfp8 for this problem size. "
-                f"Shapes: a={a.shape}, b={b.shape}, "
-                f"a_descale.shape={a_descale.shape} ({'swizzled' if a_swizzled else 'non-swizzled'}), "
-                f"b_descale.shape={b_descale.shape} ({'swizzled' if b_swizzled else 'non-swizzled'}), "
-                f"out_dtype={out_dtype}. "
-                f"{debug_str}. "
-                f"Original error: {type(e).__name__}: {str(e)}"
-            )
-        raise ValueError(error_msg) from e
-
-    return True
-
-
-@supported_compute_capability([100, 103, 110])
 def _cutlass_gemm_mxfp8_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -2630,7 +2523,7 @@ def _cutlass_gemm_mxfp8_requirement(
     b_descale: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
-    backend: Literal["cudnn", "cutlass", "auto"] = "auto",
+    backend: Literal["cutlass", "auto"] = "auto",
 ):
     return True
 
@@ -2643,16 +2536,15 @@ def _heuristic_func_mm_mxfp8(
     b_descale: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
-    backend: Literal["cudnn"] = "cudnn",
+    backend: Literal["cutlass", "auto"] = "auto",
 ) -> List[str]:
-    if CUDNN_AVAILABLE and "cudnn" in suitable_backends:
-        return ["cudnn"]
+    if "cutlass" in suitable_backends:
+        return ["cutlass"]
     return []
 
 
 @backend_requirement(
     {
-        "cudnn": _cudnn_gemm_mxfp8_requirement,
         "cutlass": _cutlass_gemm_mxfp8_requirement,
     },
     common_check=_check_mm_mxfp8_problem_size,
@@ -2665,7 +2557,7 @@ def mm_mxfp8(
     b_descale: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
-    backend: Literal["cudnn", "cutlass", "auto"] = "auto",
+    backend: Literal["cutlass", "auto"] = "auto",
 ) -> torch.Tensor:
     r"""MM MXFP8 (block size 32)
 
@@ -2698,9 +2590,9 @@ def mm_mxfp8(
     out_dtype: torch.dtype
         Output dtype, bf16 or fp16. Can be used with the  cuDNN backends. Defaults to ``torch.bfloat16``.
 
-    backend: Literal["cudnn"]
-        The backend to use for the operation. Defaults to ``"cudnn"``.
-        ``"cudnn"`` uses the cuDNN backend.
+    backend: Literal["cutlass", "auto"]
+        The backend to use for the operation. Defaults to ``"auto"``.
+        ``"auto"`` selects the CUTLASS backend.
 
     Returns
     -------
@@ -2777,7 +2669,6 @@ def mm_mxfp8(
     major, _ = get_compute_capability(a.device)
 
     backend_to_runner_factory = {
-        "cudnn": lambda: _cudnn_gemm_mxfp8_runner(),
         "cutlass": lambda: get_cutlass_mxfp8_gemm_module(
             major
         ).cutlass_mxfp8_gemm_runner(),

@@ -7,16 +7,16 @@ from flashinfer.fp8_quantization import mxfp8_quantize
 from flashinfer.utils import get_compute_capability
 
 
-@pytest.mark.parametrize("m", [128, 256, 512, 1024])
-@pytest.mark.parametrize("n", [128, 256, 512, 1024])
-@pytest.mark.parametrize("k", [128, 256, 512, 1024])
-@pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
-@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
-@pytest.mark.parametrize("out_dtype", [torch.bfloat16])
-@pytest.mark.parametrize("backend", ["cutlass"])
-@pytest.mark.parametrize("auto_tuning", [True, False])
-def test_mm_mxfp8(
-    m, n, k, input_dtype, is_sf_swizzled_layout, out_dtype, backend, auto_tuning
+def _run_mm_mxfp8(
+    m,
+    n,
+    k,
+    input_dtype,
+    is_sf_swizzled_layout,
+    out_dtype,
+    backend,
+    auto_tuning,
+    provide_out,
 ):
     compute_capability = get_compute_capability(torch.device("cuda"))
     if compute_capability[0] in [11, 12]:
@@ -32,47 +32,27 @@ def test_mm_mxfp8(
     input_mxfp8, input_scale = mxfp8_quantize(input, is_sf_swizzled_layout)
     mat2_mxfp8, mat2_scale = mxfp8_quantize(mat2, is_sf_swizzled_layout)
 
-    # Compute reference result
     reference = torch.mm(input, mat2.T)
 
-    # Prepare scales according to mm_mxfp8's expected format
-    # For input_descale: can be 1D swizzled or 2D (m, k//32)
-    # For mat2_descale: mm_mxfp8 expects (k//32, n) format (transposed)
     if is_sf_swizzled_layout:
-        # Swizzled: 1D format - mm_mxfp8 will handle reshaping internally
         input_descale = input_scale
         mat2_descale = mat2_scale  # mm_mxfp8 will handle swizzled 1D internally
     else:
-        # Non-swizzled: reshape to 2D and transpose mat2_descale
         input_descale = input_scale.view(m, k // 32)
         mat2_descale = mat2_scale.view(n, k // 32).t()  # Transpose to (k // 32, n)
 
-    # Create output tensor
-    res = torch.empty([m, n], device="cuda", dtype=out_dtype)
+    res = torch.empty([m, n], device="cuda", dtype=out_dtype) if provide_out else None
 
     with autotune(auto_tuning):
-        try:
-            mm_mxfp8(
-                input_mxfp8,
-                mat2_mxfp8.T,  # mm_mxfp8 expects mat2.T (transposed)
-                input_descale,
-                mat2_descale,
-                out=res,
-                out_dtype=out_dtype,
-                backend=backend,
-            )
-        except (ValueError, RuntimeError) as e:
-            error_msg = str(e)
-            # Skip test cases where cuDNN doesn't support the problem size
-            # This is a cuDNN limitation, not a bug in our code
-            if "cuDNN does not support mm_mxfp8" in error_msg:
-                pytest.skip(
-                    f"cuDNN does not support mm_mxfp8 for size (M={m}, N={n}, K={k}): {e}"
-                )
-            # Skip test cases where CUTLASS backend is not available
-            if "CUTLASS MXFP8 GEMM backend is not available" in error_msg:
-                pytest.skip(f"CUTLASS MXFP8 GEMM backend is not available: {e}")
-            raise
+        res = mm_mxfp8(
+            input_mxfp8,
+            mat2_mxfp8.T,  # mm_mxfp8 expects mat2.T (transposed)
+            input_descale,
+            mat2_descale,
+            out=res,
+            out_dtype=out_dtype,
+            backend=backend,
+        )
 
     assert res.shape == (m, n)
     assert res.dtype == out_dtype
@@ -82,4 +62,51 @@ def test_mm_mxfp8(
     cos_sim = F.cosine_similarity(reference.reshape(-1), res.reshape(-1), dim=0)
     assert cos_sim > min_cos_sim, (
         f"Cosine similarity {cos_sim:.4f} is too low (expected > {min_cos_sim})"
+    )
+
+
+@pytest.mark.parametrize("m", [128, 256, 512, 1024])
+@pytest.mark.parametrize("n", [128, 256, 512, 1024])
+@pytest.mark.parametrize("k", [128, 256, 512, 1024])
+@pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("backend", ["cutlass"])
+@pytest.mark.parametrize("auto_tuning", [True, False])
+def test_mm_mxfp8(
+    m, n, k, input_dtype, is_sf_swizzled_layout, out_dtype, backend, auto_tuning
+):
+    _run_mm_mxfp8(
+        m,
+        n,
+        k,
+        input_dtype,
+        is_sf_swizzled_layout,
+        out_dtype,
+        backend,
+        auto_tuning,
+        provide_out=True,
+    )
+
+
+@pytest.mark.parametrize("m", [64, 128, 256])
+@pytest.mark.parametrize("n", [128, 256])
+@pytest.mark.parametrize("k", [128, 256, 512])
+@pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("auto_tuning", [True, False])
+def test_mm_mxfp8_backend_auto(
+    m, n, k, input_dtype, is_sf_swizzled_layout, out_dtype, auto_tuning
+):
+    _run_mm_mxfp8(
+        m,
+        n,
+        k,
+        input_dtype,
+        is_sf_swizzled_layout,
+        out_dtype,
+        backend="auto",
+        auto_tuning=auto_tuning,
+        provide_out=False,
     )
