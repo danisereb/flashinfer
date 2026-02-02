@@ -3099,6 +3099,13 @@ def _pad_up(x, y):
     return ((x + y - 1) // y) * y
 
 
+def _mxfp8_swizzled_scale_len(m: int, k: int) -> int:
+    """Return the 1D swizzled scale length for MXFP8 (F8_128x4 layout)."""
+    m_padded = _pad_up(m, 128)
+    num_k_tiles = _pad_up(k, 128) // 128
+    return m_padded * num_k_tiles * 4
+
+
 _MM_FP4_TUNING_CONFIG_8x4 = TuningConfig(
     dynamic_tensor_specs=(
         DynamicTensorSpec(
@@ -3160,7 +3167,11 @@ _MM_MXFP8_TUNING_CONFIG = TuningConfig(
         ConstraintSpec(
             2,  # a_descale_tensor_index
             0,
-            lambda shapes: _pad_up(shapes[0][0], 128),
+            lambda shapes: (
+                _mxfp8_swizzled_scale_len(shapes[0][0], shapes[0][1])
+                if len(shapes[2]) == 1
+                else shapes[0][0]
+            ),
         ),
         ConstraintSpec(
             5,  # out_tensor_index
