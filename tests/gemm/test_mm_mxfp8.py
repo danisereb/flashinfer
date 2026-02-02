@@ -1514,6 +1514,46 @@ def test_mm_mxfp8_autotuner_tma_safety():
     assert cos_sim > 0.90, f"Accuracy too low after autotuning: {cos_sim:.4f}"
 
 
+@pytest.mark.parametrize(
+    "m,n,k",
+    [
+        (256, 4096, 4096),
+        (512, 6144, 4096),
+        (1024, 14336, 4096),
+        (16384, 6144, 4096),
+    ],
+)
+def test_mm_mxfp8_autotune_cluster_shapes_coverage(m, n, k):
+    """Run autotune on representative shapes to cover more cluster configs."""
+    _skip_if_unsupported()
+
+    torch.manual_seed(42)
+    input_bf16 = torch.randn([m, k], device="cuda", dtype=torch.bfloat16) * 0.1
+    weight_bf16 = torch.randn([n, k], device="cuda", dtype=torch.bfloat16) * 0.02
+
+    input_fp8, input_scale = mxfp8_quantize(input_bf16, is_sf_swizzled_layout=True)
+    weight_fp8, weight_scale = mxfp8_quantize(weight_bf16, is_sf_swizzled_layout=True)
+
+    reference = torch.mm(input_bf16, weight_bf16.T)
+
+    with autotune(True):
+        output = mm_mxfp8(
+            input_fp8,
+            weight_fp8.T,
+            input_scale,
+            weight_scale,
+            out_dtype=torch.bfloat16,
+            backend="cutlass",
+        )
+
+    assert output.shape == (m, n)
+    assert torch.isfinite(output).all()
+    cos_sim = F.cosine_similarity(
+        reference.reshape(-1).float(), output.reshape(-1).float(), dim=0
+    ).item()
+    assert cos_sim > 0.90, f"Accuracy too low after autotuning: {cos_sim:.4f}"
+
+
 @pytest.mark.parametrize("alignment", [0, 64, 128, 256])
 def test_mm_mxfp8_memory_alignment(alignment):
     """Test mm_mxfp8 with various memory alignments.
