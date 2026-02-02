@@ -58,6 +58,10 @@ def _run_mm_mxfp8(
     assert torch.isfinite(res).all(), "Output contains NaN/Inf values"
 
     min_cos_sim = 0.89  # Slightly lowered to account for floating point variance
+    if is_sf_swizzled_layout:
+        # Swizzled format has higher accuracy
+        min_cos_sim = 0.95
+
     cos_sim = F.cosine_similarity(reference.reshape(-1), res.reshape(-1), dim=0)
     assert cos_sim > min_cos_sim, (
         f"Cosine similarity {cos_sim:.4f} is too low (expected > {min_cos_sim})"
