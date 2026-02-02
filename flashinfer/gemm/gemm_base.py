@@ -2443,13 +2443,34 @@ def _create_cutlass_mxfp8_gemm_module(module, op_name: str, tuner_name: str):
                     workspace_buffer,
                 ) = inputs
 
-                # NOTE: b_descale.T may create a non-contiguous view when b_descale
-                # is 2D (N, K/32). CUTLASS requires contiguous tensors.
-                b_descale_t = b_descale.T
-                if not b_descale_t.is_contiguous():
-                    b_descale_t = b_descale_t.contiguous()
+                # CUTLASS expects b_descale in (N, K/32) layout matching the B matrix
+                # storage layout [N, K] (after b.T is applied below).
+                #
+                # The mm_mxfp8 API accepts b_descale in either:
+                # - 2D: (K/32, N) transposed format → need to transpose back to (N, K/32)
+                # - 1D swizzled: already in correct F8_128x4 layout → pass as-is
+                #
+                # For 2D input, transpose to (N, K/32) and make contiguous.
+                # For 1D input, it's already in the correct swizzled format.
+                if b_descale.ndim == 2:
+                    # Input is (K/32, N), transpose to (N, K/32) for CUTLASS
+                    b_descale_processed = b_descale.T
+                    if not b_descale_processed.is_contiguous():
+                        b_descale_processed = b_descale_processed.contiguous()
+                else:
+                    # 1D swizzled format - pass as-is, just ensure contiguous
+                    b_descale_processed = b_descale
+                    if not b_descale_processed.is_contiguous():
+                        b_descale_processed = b_descale_processed.contiguous()
+
                 module.mxfp8_gemm(
-                    a, b.T, a_descale, b_descale_t, out, workspace_buffer, tactic
+                    a,
+                    b.T,
+                    a_descale,
+                    b_descale_processed,
+                    out,
+                    workspace_buffer,
+                    tactic,
                 )
                 return out
 
@@ -2577,7 +2598,6 @@ def mm_mxfp8(
         - 1D swizzled: shape (M_padded * K_padded,) where M_padded = round_up(m, 128), K_padded = round_up(k // 32, 4)
         dtype: float8_e4m3fn or uint8.
 
-    # TODO: check maybe we need (n, k // 32)
     b_descale: torch.Tensor
         Block scale tensor for B. Can be:
         - 2D non-swizzled: shape (k // 32, n) - transposed format
@@ -2606,23 +2626,27 @@ def mm_mxfp8(
     >>> import torch
     >>> from flashinfer import mxfp8_quantize, mm_mxfp8
     >>> m, n, k = 48, 256, 128
+    >>> # Create input tensors - note: weight is [n, k] for typical NN layers
     >>> a = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
-    >>> b = torch.randn([k, n], device="cuda", dtype=torch.bfloat16)
-    >>> # Option 1: Use swizzled layout for optimal performance (recommended)
+    >>> weight = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
+    >>>
+    >>> # Option 1: Use swizzled layout (recommended for accuracy)
+    >>> # Quantize input [m, k] - scales are 1D swizzled for (M, K/32) layout
     >>> a_mx, a_sf = mxfp8_quantize(input=a, is_sf_swizzled_layout=True)
-    >>> b_mx, b_sf = mxfp8_quantize(input=b, is_sf_swizzled_layout=True)
-    >>> # For b_descale, reshape from (n * k // 32,) to (n, k // 32), then transpose
-    >>> b_sf_2d = b_sf.view(-1, k // 32).t().contiguous() if b_sf.ndim == 2 else b_sf.view(n, k // 32).t().contiguous()
-    >>> # mm_mxfp8 will automatically handle swizzled 1D scales
-    >>> out = mm_mxfp8(a_mx, b_mx.t(), a_sf, b_sf_2d, torch.bfloat16)
+    >>> # Quantize weight [n, k] - scales are 1D swizzled for (N, K/32) layout
+    >>> w_mx, w_sf = mxfp8_quantize(input=weight, is_sf_swizzled_layout=True)
+    >>> # Pass weight.T as [k, n] and 1D swizzled scales directly
+    >>> out = mm_mxfp8(a_mx, w_mx.t(), a_sf, w_sf, out_dtype=torch.bfloat16)
     >>> out.shape
     torch.Size([48, 256])
+    >>>
     >>> # Option 2: Use non-swizzled layout (for compatibility)
     >>> a_mx, a_sf = mxfp8_quantize(input=a, is_sf_swizzled_layout=False)
-    >>> b_mx, b_sf = mxfp8_quantize(input=b, is_sf_swizzled_layout=False)
+    >>> w_mx, w_sf = mxfp8_quantize(input=weight, is_sf_swizzled_layout=False)
+    >>> # For non-swizzled: reshape to 2D and transpose weight scale to (k//32, n)
     >>> a_sf_2d = a_sf.view(m, k // 32)
-    >>> b_sf_2d = b_sf.view(n, k // 32).t()  # Transpose to (k // 32, n)
-    >>> out = mm_mxfp8(a_mx, b_mx.t(), a_sf_2d, b_sf_2d, torch.bfloat16)
+    >>> w_sf_2d = w_sf.view(n, k // 32).t()  # Transpose to (k // 32, n)
+    >>> out = mm_mxfp8(a_mx, w_mx.t(), a_sf_2d, w_sf_2d, out_dtype=torch.bfloat16)
     >>> out.shape
     torch.Size([48, 256])
     """
