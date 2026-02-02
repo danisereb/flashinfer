@@ -203,10 +203,10 @@ std::vector<CutlassGemmConfig> CutlassMxfp8GemmRunner<T, mxfp8GemmType>::getConf
   };
 
   std::vector<ClusterShape> clusterShapes = {
-      ClusterShape::ClusterShape_1x1x1,
-      ClusterShape::ClusterShape_1x2x1,
-      ClusterShape::ClusterShape_2x1x1,
-      ClusterShape::ClusterShape_2x2x1,
+      ClusterShape::ClusterShape_1x1x1, ClusterShape::ClusterShape_1x2x1,
+      ClusterShape::ClusterShape_2x1x1, ClusterShape::ClusterShape_2x2x1,
+      ClusterShape::ClusterShape_1x4x1, ClusterShape::ClusterShape_2x4x1,
+      ClusterShape::ClusterShape_4x2x1, ClusterShape::ClusterShape_4x4x1,
   };
   for (auto const& tile_config : tilesSm100) {
     for (auto const& cluster_config : clusterShapes) {
