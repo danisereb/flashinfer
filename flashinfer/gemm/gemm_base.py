@@ -979,8 +979,13 @@ def _create_cutlass_fp4_gemm_module(module, op_name: str, tuner_name: str):
                     a_descale = a_descale.view(torch.uint8)
                 if b.dtype == torch.uint8 and b_descale.dtype == torch.float8_e4m3fn:
                     b_descale = b_descale.view(torch.uint8)
+                # NOTE: b_descale.T may create a non-contiguous view when b_descale
+                # is 2D. CUTLASS requires contiguous tensors.
+                b_descale_t = b_descale.T
+                if not b_descale_t.is_contiguous():
+                    b_descale_t = b_descale_t.contiguous()
                 module.fp4_gemm(
-                    a, b.T, a_descale, b_descale.T, alpha, out, workspace_buffer, tactic
+                    a, b.T, a_descale, b_descale_t, alpha, out, workspace_buffer, tactic
                 )
                 return out
 
@@ -2438,16 +2443,13 @@ def _create_cutlass_mxfp8_gemm_module(module, op_name: str, tuner_name: str):
                     workspace_buffer,
                 ) = inputs
 
-                # TODO: remove commented code if not required
-                # if a.dtype == torch.float8_e4m3fn and a_descale.dtype == torch.uint8:
-                #    a_descale = a_descale.view(torch.uint8)
-
-                # if b.dtype == torch.float8_e4m3fn and b_descale.dtype == torch.uint8:
-                #    b_descale = b_descale.view(torch.uint8)
-
-                # TODO: add mxfp8_gemm CUDA
+                # NOTE: b_descale.T may create a non-contiguous view when b_descale
+                # is 2D (N, K/32). CUTLASS requires contiguous tensors.
+                b_descale_t = b_descale.T
+                if not b_descale_t.is_contiguous():
+                    b_descale_t = b_descale_t.contiguous()
                 module.mxfp8_gemm(
-                    a, b.T, a_descale, b_descale.T, out, workspace_buffer, tactic
+                    a, b.T, a_descale, b_descale_t, out, workspace_buffer, tactic
                 )
                 return out
 
@@ -3762,12 +3764,17 @@ def get_trtllm_fp4_gemm_module():
                     _,
                     workspace_buffer,
                 ) = inputs
+                # NOTE: b_descale.T may create a non-contiguous view when b_descale
+                # is 2D. CUTLASS requires contiguous tensors.
+                b_descale_t = b_descale.T
+                if not b_descale_t.is_contiguous():
+                    b_descale_t = b_descale_t.contiguous()
                 self._fp4_gemm_runner(
                     workspace_buffer,
                     a,
                     b.T,
                     a_descale,
-                    b_descale.T,
+                    b_descale_t,
                     alpha,
                     out,
                     self._use_8x4_sf_layout,
