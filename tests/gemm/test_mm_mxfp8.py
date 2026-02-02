@@ -513,13 +513,7 @@ def test_mm_mxfp8_external_swizzle(m, n, k):
         (4096, 4096),
         (6144, 4096),
         (14336, 4096),
-        pytest.param(
-            4096,
-            14336,
-            marks=pytest.mark.xfail(
-                reason="Known CUTLASS issue with K=14336 - swizzled scales produce incorrect results"
-            ),
-        ),
+        (4096, 14336),
     ],
 )
 def test_mm_mxfp8_swizzled_vs_nonswizzled_accuracy(m, n, k):
@@ -530,6 +524,8 @@ def test_mm_mxfp8_swizzled_vs_nonswizzled_accuracy(m, n, k):
     non-swizzled scales (cos_sim ~0.83).
     """
     _skip_if_unsupported()
+    if k == 14336:
+        pytest.xfail("Known CUTLASS issue with K=14336 in swizzled layout (cos_sim=0).")
 
     torch.manual_seed(42)  # Reproducibility
 
@@ -1122,12 +1118,7 @@ def test_mm_mxfp8_accuracy_vs_block_analysis():
     "k",
     [
         4096,
-        pytest.param(
-            14336,
-            marks=pytest.mark.xfail(
-                reason="Known CUTLASS issue with K=14336 - swizzled scales produce incorrect results"
-            ),
-        ),
+        14336,
     ],
 )
 def test_mm_mxfp8_target_095_cosine_similarity(m, n, k):
@@ -1187,13 +1178,7 @@ def test_mm_mxfp8_target_095_cosine_similarity(m, n, k):
         (6144, 4096),  # QKV projection
         (4096, 4096),  # O projection
         (28672, 4096),  # Gate+Up projection combined
-        pytest.param(
-            4096,
-            14336,
-            marks=pytest.mark.xfail(
-                reason="Known CUTLASS issue with K=14336 (K/32=448) and large M - produces NaN/Inf or incorrect results"
-            ),
-        ),  # Down projection - known issue
+        (4096, 14336),  # Down projection
     ],
 )
 @pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
@@ -1213,6 +1198,8 @@ def test_mm_mxfp8_large_batch_tma_safety(m, n, k, is_sf_swizzled_layout):
     - Incorrect globalDim interpretation for 1D swizzled scales
     """
     _skip_if_unsupported()
+    if is_sf_swizzled_layout and k == 14336:
+        pytest.xfail("Known CUTLASS issue with K=14336 in swizzled layout for large M.")
 
     torch.manual_seed(42)
 
@@ -1280,13 +1267,7 @@ def test_mm_mxfp8_large_batch_tma_safety(m, n, k, is_sf_swizzled_layout):
         (6144, 4096),
         (4096, 4096),
         (28672, 4096),
-        pytest.param(
-            4096,
-            14336,
-            marks=pytest.mark.xfail(
-                reason="Known CUTLASS issue with K=14336 and M=16384 - produces NaN/Inf or incorrect results"
-            ),
-        ),
+        (4096, 14336),
     ],
 )
 def test_mm_mxfp8_external_swizzle_large_batch(m, n, k):
