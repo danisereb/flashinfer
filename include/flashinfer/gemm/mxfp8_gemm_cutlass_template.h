@@ -201,9 +201,12 @@ std::vector<CutlassGemmConfig> CutlassMxfp8GemmRunner<T, mxfp8GemmType>::getConf
       CutlassTileConfigSM100::CtaShape128x128x256B,
       CutlassTileConfigSM100::CtaShape128x256x256B,
   };
-  // Other cluster shaped may cause "Error: Failed to initialize the TMA descriptor 700"
+
   std::vector<ClusterShape> clusterShapes = {
       ClusterShape::ClusterShape_1x1x1,
+      ClusterShape::ClusterShape_1x2x1,
+      ClusterShape::ClusterShape_2x1x1,
+      ClusterShape::ClusterShape_2x2x1,
   };
   for (auto const& tile_config : tilesSm100) {
     for (auto const& cluster_config : clusterShapes) {
