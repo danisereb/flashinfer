@@ -196,6 +196,7 @@ std::vector<CutlassGemmConfig> CutlassMxfp8GemmRunner<T, mxfp8GemmType>::getConf
   std::vector<CutlassGemmConfig> candidateConfigs;
 
   std::vector<CutlassTileConfigSM100> tilesSm100 = {
+      CutlassTileConfigSM100::CtaShape128x64x128B,
       CutlassTileConfigSM100::CtaShape128x256x128B,
       CutlassTileConfigSM100::CtaShape128x128x256B,
       CutlassTileConfigSM100::CtaShape128x256x256B,
