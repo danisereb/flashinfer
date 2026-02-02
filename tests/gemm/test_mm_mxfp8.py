@@ -524,8 +524,6 @@ def test_mm_mxfp8_swizzled_vs_nonswizzled_accuracy(m, n, k):
     non-swizzled scales (cos_sim ~0.83).
     """
     _skip_if_unsupported()
-    if k == 14336:
-        pytest.xfail("Known CUTLASS issue with K=14336 in swizzled layout (cos_sim=0).")
 
     torch.manual_seed(42)  # Reproducibility
 
@@ -1198,8 +1196,6 @@ def test_mm_mxfp8_large_batch_tma_safety(m, n, k, is_sf_swizzled_layout):
     - Incorrect globalDim interpretation for 1D swizzled scales
     """
     _skip_if_unsupported()
-    if is_sf_swizzled_layout and k == 14336:
-        pytest.xfail("Known CUTLASS issue with K=14336 in swizzled layout for large M.")
 
     torch.manual_seed(42)
 
