@@ -300,60 +300,72 @@ def test_mm_mxfp8_find_minimum_cosine_similarity():
     """
     _skip_if_unsupported()
 
-    m, n, k = 256, 4096, 4096  # Typical transformer layer size
+    m, n, k = 256, 4096, 4096
 
     value_scales = [0.001, 0.01, 0.02, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 50.0, 100.0]
-    results = []
 
-    for value_scale in value_scales:
-        input_data = (
-            torch.randn([m, k], device="cuda", dtype=torch.bfloat16) * value_scale
+    for is_sf_swizzled_layout in [False, True]:
+        results = []
+        for value_scale in value_scales:
+            input_data = (
+                torch.randn([m, k], device="cuda", dtype=torch.bfloat16) * value_scale
+            )
+            mat2 = (
+                torch.randn([n, k], device="cuda", dtype=torch.bfloat16) * value_scale
+            )
+
+            input_mxfp8, input_scale = mxfp8_quantize(
+                input_data, is_sf_swizzled_layout=is_sf_swizzled_layout
+            )
+            mat2_mxfp8, mat2_scale = mxfp8_quantize(
+                mat2, is_sf_swizzled_layout=is_sf_swizzled_layout
+            )
+
+            reference = torch.mm(input_data, mat2.T)
+
+            input_descale = input_scale.view(m, k // 32)
+            mat2_descale = mat2_scale.view(n, k // 32).t()
+
+            result = mm_mxfp8(
+                input_mxfp8,
+                mat2_mxfp8.T,
+                input_descale,
+                mat2_descale,
+                out_dtype=torch.bfloat16,
+                backend="cutlass",
+            )
+
+            cos_sim = F.cosine_similarity(
+                reference.reshape(-1).float(), result.reshape(-1).float(), dim=0
+            ).item()
+
+            results.append((value_scale, cos_sim))
+
+        # Print summary
+        print("\n" + "=" * 60)
+        print(
+            f"MXFP8 Cosine Similarity vs Value Scale Summary ({is_sf_swizzled_layout=})"
         )
-        mat2 = torch.randn([n, k], device="cuda", dtype=torch.bfloat16) * value_scale
+        print("=" * 60)
 
-        input_mxfp8, input_scale = mxfp8_quantize(
-            input_data, is_sf_swizzled_layout=False
+        min_cosine_sim = 0.8
+        if is_sf_swizzled_layout:
+            min_cosine_sim = 0.97
+
+        for scale, sim in results:
+            status = "[OK]" if sim > min_cosine_sim else "[FAIL]"
+            print(f"  {status} Scale={scale:8.3f}: cos_sim={sim:.4f}")
+
+        min_sim = min(sim for _, sim in results)
+        min_scale = [scale for scale, sim in results if sim == min_sim][0]
+        print(f"\n  Minimum cosine similarity: {min_sim:.4f} at scale={min_scale}")
+        print("=" * 60)
+
+        # Assert minimum acceptable similarity
+        assert min_sim > min_cosine_sim, (
+            f"Minimum cosine similarity {min_sim:.4f} at scale={min_scale} is too low. "
+            f"MXFP8 should maintain > 0.80 similarity across all value ranges."
         )
-        mat2_mxfp8, mat2_scale = mxfp8_quantize(mat2, is_sf_swizzled_layout=False)
-
-        reference = torch.mm(input_data, mat2.T)
-
-        input_descale = input_scale.view(m, k // 32)
-        mat2_descale = mat2_scale.view(n, k // 32).t()
-
-        result = mm_mxfp8(
-            input_mxfp8,
-            mat2_mxfp8.T,
-            input_descale,
-            mat2_descale,
-            out_dtype=torch.bfloat16,
-            backend="cutlass",
-        )
-
-        cos_sim = F.cosine_similarity(
-            reference.reshape(-1).float(), result.reshape(-1).float(), dim=0
-        ).item()
-
-        results.append((value_scale, cos_sim))
-
-    # Print summary
-    print("\n" + "=" * 60)
-    print("MXFP8 Cosine Similarity vs Value Scale Summary")
-    print("=" * 60)
-    for scale, sim in results:
-        status = "[OK]" if sim > 0.85 else "[FAIL]"
-        print(f"  {status} Scale={scale:8.3f}: cos_sim={sim:.4f}")
-
-    min_sim = min(sim for _, sim in results)
-    min_scale = [scale for scale, sim in results if sim == min_sim][0]
-    print(f"\n  Minimum cosine similarity: {min_sim:.4f} at scale={min_scale}")
-    print("=" * 60)
-
-    # Assert minimum acceptable similarity
-    assert min_sim > 0.80, (
-        f"Minimum cosine similarity {min_sim:.4f} at scale={min_scale} is too low. "
-        f"MXFP8 should maintain > 0.80 similarity across all value ranges."
-    )
 
 
 # ==============================================================================
