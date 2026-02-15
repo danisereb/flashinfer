@@ -33,6 +33,7 @@ from .core import (
     trtllm_fp8_per_tensor_scale_moe,
     trtllm_bf16_moe,
     trtllm_mxint4_block_scale_moe,
+    trtllm_mxfp8_block_scale_moe,
 )
 
 from .fused_routing_dsv3 import (  # noqa: F401
@@ -69,6 +70,7 @@ __all__ = [
     "trtllm_fp8_block_scale_routed_moe",
     "trtllm_fp8_per_tensor_scale_moe",
     "trtllm_mxint4_block_scale_moe",
+    "trtllm_mxfp8_block_scale_moe",
     "fused_topk_deepseek",
 ]
 

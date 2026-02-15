@@ -60,6 +60,8 @@ def run_moe_test(args):
         return testTrtllmFp8BlockScaleMoe(args)
     elif args.routine == "trtllm_fp8_per_tensor_scale_moe":
         return testTrtllmFp8PerTensorScaleMoe(args)
+    # elif args.routine == "trtllm_mxfp8_block_scale_moe":
+    #     return testTrtllmMxFp8BlockScaleMoe(args)
     elif args.routine == "cutlass_fused_moe":
         return testCutlassFusedMoe(args)
     else:

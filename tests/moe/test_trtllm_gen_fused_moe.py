@@ -40,6 +40,7 @@ from flashinfer.fused_moe import (
     trtllm_fp8_block_scale_moe,
     trtllm_fp8_per_tensor_scale_moe,
     trtllm_bf16_moe,
+    trtllm_mxfp8_block_scale_moe,
     trtllm_mxint4_block_scale_moe,
 )
 from flashinfer.fused_moe.core import (
@@ -3029,3 +3030,215 @@ def test_llama4_routing(
         activation_type,
         cache_permute_indices,
     )
+
+
+# ====================================================================================
+# MXFP8 Block Scale Quantization Implementation
+# ====================================================================================
+
+
+class MxFP8BlockScaleMoe(Moe):
+    """MxFP8 MoE implementation with block scaling (DeepSeek style)."""
+
+    @property
+    def quant_mode(self) -> QuantMode:
+        return QuantMode.MXFP8_BLOCK_SCALE
+
+    def quantize_weights(self, gemm1_weights, gemm2_weights, hidden_states_sample):
+        """Quantize weights to MxFP8 with block scaling."""
+        num_experts = gemm1_weights.shape[0]
+        intermediate_size = gemm1_weights.shape[1] // 2
+        hidden_size = gemm1_weights.shape[2]
+
+        gemm1_weights_fp8 = gemm1_weights.to(torch.float8_e4m3fn)
+        gemm1_scales = 2 * torch.rand(
+            (num_experts, 2 * intermediate_size // 128, hidden_size // 128),
+            device="cuda",
+        ).to(torch.float)
+
+        gemm2_weights_fp8 = gemm2_weights.to(torch.float8_e4m3fn)
+        gemm2_scales = 2 * torch.rand(
+            (num_experts, hidden_size // 128, intermediate_size // 128), device="cuda"
+        ).to(torch.float)
+
+        return {
+            "hidden_states_scale_global": None,
+            "gemm1_weights": gemm1_weights_fp8,
+            "gemm1_scales": gemm1_scales,
+            "gemm1_scales_global": None,
+            "gemm2_weights": gemm2_weights_fp8,
+            "gemm2_scales": gemm2_scales,
+            "gemm2_scales_global": None,
+        }
+
+    def quantize_inputs(self, hidden_states: torch.Tensor, hidden_states_scale_global):
+        """Generate MxFP8 block scales and quantize hidden states at runtime."""
+
+        def to_float8_blockwise(
+            x,
+            block_size_m=128,
+            block_size_n=128,
+            dtype=torch.float8_e4m3fn,
+            transpose_scale=True,
+            is_blockm=False,
+            is_blockn=True,
+        ):
+            assert x.dtype == torch.bfloat16
+            x = x.contiguous()
+            assert x.dim() == 2
+            m, n = x.shape
+
+            m_tile = block_size_m if is_blockm else 1
+            n_tile = block_size_n if is_blockn else 1
+            num_blocks_m = m // m_tile
+            num_blocks_n = n // n_tile
+
+            quantized_x = torch.empty_like(x, dtype=dtype, device=x.device)
+            scales = torch.empty(
+                (num_blocks_m, num_blocks_n), dtype=torch.float32, device=x.device
+            )
+
+            finfo = torch.finfo(dtype)
+            for i in range(num_blocks_m):
+                for j in range(num_blocks_n):
+                    start_m, end_m = i * m_tile, min((i + 1) * m_tile, m)
+                    start_n, end_n = j * n_tile, min((j + 1) * n_tile, n)
+
+                    block = x[start_m:end_m, start_n:end_n]
+
+                    min_val, max_val = block.aminmax()
+                    amax = torch.maximum(min_val.abs(), max_val.abs()).clamp(min=1e-12)
+                    scale = finfo.max / amax
+
+                    quantized_block = (block * scale).clamp(
+                        min=finfo.min, max=finfo.max
+                    )
+                    quantized_x[start_m:end_m, start_n:end_n] = quantized_block.to(
+                        dtype
+                    )
+                    scales[i, j] = scale.float().reciprocal()
+
+            if transpose_scale:
+                scales = scales.t()
+
+            return quantized_x, scales
+
+        hidden_states_quant, hidden_states_scale = to_float8_blockwise(hidden_states)
+        return {
+            "hidden_states": hidden_states_quant,
+            "hidden_states_scale": hidden_states_scale,
+        }
+
+    def prepare_static_weights_for_kernel(
+        self,
+        args_dequant,
+        args,
+        gemm1_weights_orig,
+        gemm2_weights_orig,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        weight_processing,
+    ):
+        """Prepare quantized weights for kernel (done offline with weights)."""
+        use_shuffled_weight = weight_processing["use_shuffled_weight"]
+        weight_layout = weight_processing["layout"]
+
+        if use_shuffled_weight:
+            epilogue_tile_m = 64
+
+            gemm1_weights_fp8_shuffled = []
+            gemm2_weights_fp8_shuffled = []
+            for i in range(num_experts):
+                tmp_weights1 = shuffle_matrix_a(
+                    args.gemm1_weights[i].view(torch.uint8), epilogue_tile_m
+                )
+                tmp_weights2 = shuffle_matrix_a(
+                    args.gemm2_weights[i].view(torch.uint8), epilogue_tile_m
+                )
+
+                if weight_layout == WeightLayout.BlockMajorK:
+                    block_k = 128
+                    tmp_weights1 = convert_to_block_layout(tmp_weights1, block_k)
+                    tmp_weights2 = convert_to_block_layout(tmp_weights2, block_k)
+
+                gemm1_weights_fp8_shuffled.append(tmp_weights1)
+                gemm2_weights_fp8_shuffled.append(tmp_weights2)
+
+            kernel_gemm1_weights = torch.stack(gemm1_weights_fp8_shuffled).view(
+                torch.float8_e4m3fn
+            )
+            kernel_gemm2_weights = torch.stack(gemm2_weights_fp8_shuffled).view(
+                torch.float8_e4m3fn
+            )
+        else:
+            kernel_gemm1_weights = args.gemm1_weights
+            kernel_gemm2_weights = args.gemm2_weights
+
+        return {
+            "gemm1_weights": kernel_gemm1_weights,
+            "gemm1_scales": args.gemm1_scales,
+            "gemm2_weights": kernel_gemm2_weights,
+            "gemm2_scales": args.gemm2_scales,
+            "use_shuffled_weight": use_shuffled_weight,
+            "weight_layout": weight_layout,
+        }
+
+    def call_moe(
+        self, static_data, hidden_states_orig, hidden_states_scale_global, **kwargs
+    ):
+        """Call MoE with runtime block scale generation + kernel execution."""
+        expert_logits = kwargs["expert_logits"]
+        routing_bias = kwargs["routing_bias"]
+        num_experts = kwargs["num_experts"]
+        top_k = kwargs["top_k"]
+        n_groups = kwargs["n_groups"]
+        top_k_groups = kwargs["top_k_groups"]
+        intermediate_size = kwargs["intermediate_size"]
+        routed_scaling = kwargs["routed_scaling"]
+        routing_method_type = kwargs["routing_method_type"]
+        enable_autotune = kwargs.get("enable_autotune", True)
+        enable_pdl = kwargs.get("enable_pdl")
+        activation_type = kwargs["activation_type"]
+        hidden_states_scale = kwargs["hidden_states_scale"]
+        hidden_states_quant = kwargs["hidden_states_quant"]
+
+        hidden_states_fp8 = hidden_states_quant.to(torch.float8_e4m3fn)
+        assert not torch.isnan(hidden_states_fp8.float()).any(), (
+            "NaN detected in hidden_states_fp8"
+        )
+
+        with autotune(enable_autotune):
+            output = trtllm_mxfp8_block_scale_moe(
+                expert_logits,
+                routing_bias,
+                hidden_states_fp8,
+                hidden_states_scale,
+                static_data["gemm1_weights"],
+                static_data["gemm1_scales"],
+                static_data["gemm2_weights"],
+                static_data["gemm2_scales"],
+                num_experts,
+                top_k,
+                n_groups,
+                top_k_groups,
+                intermediate_size,
+                0,
+                num_experts,
+                routed_scaling,
+                routing_method_type,
+                use_shuffled_weight=static_data["use_shuffled_weight"],
+                weight_layout=static_data["weight_layout"],
+                enable_pdl=enable_pdl,
+                activation_type=activation_type,
+                tune_max_num_tokens=TUNE_MAX_NUM_TOKENS,
+            )
+        return output.to(torch.float)
+
+    def compute_reference(self, args):
+        """MxFP8 block-scale reference implementation."""
+        return run_moe_reference_dsfp8(args)
+
+    def get_tolerances(self):
+        """Get MxFP8 block-scale accuracy tolerances."""
+        return {"atol": 0.1, "rtol": 0.85, "percent": 0.8}

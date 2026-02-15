@@ -17,6 +17,7 @@ limitations under the License.
 import pytest
 from typing import Literal
 import torch
+import torch.nn.functional as F
 
 from flashinfer import (
     RoutingMethodType,
@@ -29,6 +30,7 @@ from flashinfer.fused_moe import (
     trtllm_fp4_block_scale_routed_moe,
     trtllm_fp8_block_scale_moe,
     trtllm_fp8_block_scale_routed_moe,
+    trtllm_mxfp8_block_scale_moe,
 )
 from flashinfer.utils import device_support_pdl
 
@@ -39,6 +41,49 @@ from .test_trtllm_gen_fused_moe import (
 )
 
 from flashinfer.utils import get_compute_capability
+
+
+def _bf16_moe_reference(
+    routing_logits: torch.Tensor,
+    hidden_states: torch.Tensor,
+    gemm1_weights: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    top_k: int,
+    routing_method_type: RoutingMethodType,
+) -> torch.Tensor:
+    num_tokens = hidden_states.shape[0]
+    hidden_size = hidden_states.shape[1]
+    intermediate_size = gemm1_weights.shape[1] // 2
+    num_experts = gemm1_weights.shape[0]
+
+    if routing_method_type != RoutingMethodType.Renormalize:
+        raise ValueError("Reference only supports Renormalize routing.")
+
+    permute_info, expert_weights_ref = routing_reference_renormalize(
+        routing_logits, top_k, num_experts, 8
+    )
+    topk_ids = permute_info["topKIndices"].to(torch.int64)
+    expert_weights = expert_weights_ref.view(num_tokens, num_experts)[
+        torch.arange(num_tokens, device=hidden_states.device).unsqueeze(1), topk_ids
+    ].to(torch.float)
+
+    output = torch.zeros(
+        num_tokens, hidden_size, device=hidden_states.device, dtype=torch.float
+    )
+    for token_idx in range(num_tokens):
+        x = hidden_states[token_idx].to(torch.float)
+        for k in range(top_k):
+            expert_idx = topk_ids[token_idx, k].item()
+            w = expert_weights[token_idx, k]
+            w1 = gemm1_weights[expert_idx].to(torch.float)
+            w2 = gemm2_weights[expert_idx].to(torch.float)
+            gemm1 = x @ w1.t()
+            x1 = gemm1[:intermediate_size]
+            x2 = gemm1[intermediate_size:]
+            act = F.silu(x2) * x1
+            gemm2 = act @ w2.t()
+            output[token_idx] += w * gemm2
+    return output
 
 
 @pytest.mark.parametrize("num_tokens", [1, 8, 1024])
@@ -384,3 +429,221 @@ def test_trtllm_gen_fp8_routed_fused_moe(
     # mismatch percentage
     mismatch_pct = (~mask).float().mean().item() * 100
     assert mismatch_pct < 10, f"Mismatch percentage is {mismatch_pct:.2f}%"
+
+
+# MxFP8 block scale MoE test
+# MxFP8 uses block size 32 for microscaling (values in e4m3, scales in e8m0/uint8)
+@pytest.mark.parametrize("num_tokens", [64, 128])
+@pytest.mark.parametrize("hidden_size", [2048, 4096])
+@pytest.mark.parametrize("intermediate_size", [2048, 4096])
+@pytest.mark.parametrize("num_experts", [128])
+@pytest.mark.parametrize("top_k", [6])
+@pytest.mark.parametrize(
+    "routing_method_type",
+    [
+        RoutingMethodType.Renormalize,
+    ],
+)
+def test_trtllm_gen_mxfp8_routed_fused_moe(
+    num_tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+    top_k: int,
+    num_experts: int,
+    routing_method_type: RoutingMethodType,
+):
+    """Test MxFP8 block scale routed MoE matches standard routing."""
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] not in [10]:
+        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+    torch.manual_seed(42)
+    device = torch.device("cuda:0")
+    enable_pdl = device_support_pdl(device)
+
+    # MxFP8 block size is 32; dimensions must be multiples of 32
+    intermediate_size = (intermediate_size + 31) // 32 * 32
+
+    routing_logits = torch.rand(num_tokens, num_experts, device=device).to(
+        torch.bfloat16
+    )
+
+    # MxFP8 quantize hidden states to get properly formatted fp8 values + e8m0 scales
+    hidden_states, hidden_states_scale = mxfp8_quantize(
+        torch.randn(num_tokens, hidden_size, device=device, dtype=torch.bfloat16) * 0.1
+    )
+
+    # Relu2 is non-gated: GEMM1 outputs intermediate_size (not 2*intermediate_size)
+    act_type = ActivationType.Relu2
+
+    # Weights in fp8_e4m3fn, scales in uint8 (e8m0)
+    gemm1_weights = torch.randn(
+        num_experts, intermediate_size, hidden_size, device=device
+    ).to(torch.float8_e4m3fn)
+    gemm2_weights = torch.randn(
+        num_experts, hidden_size, intermediate_size, device=device
+    ).to(torch.float8_e4m3fn)
+
+    # Weight scales: one e8m0 scale per 32 elements along K dimension
+    gemm1_weights_scale = torch.ones(
+        num_experts,
+        intermediate_size,
+        hidden_size // 32,
+        device=device,
+        dtype=torch.uint8,
+    )
+    gemm2_weights_scale = torch.ones(
+        num_experts,
+        hidden_size,
+        intermediate_size // 32,
+        device=device,
+        dtype=torch.uint8,
+    )
+
+    # To avoid long auto-tuning time
+    tune_max_num_tokens = max(128, num_tokens)
+
+    reference_output = trtllm_mxfp8_block_scale_moe(
+        routing_logits,
+        None,  # routing_bias
+        hidden_states,
+        hidden_states_scale,
+        gemm1_weights,
+        gemm1_weights_scale,
+        gemm2_weights,
+        gemm2_weights_scale,
+        num_experts,
+        top_k,
+        1,  # n_group
+        1,  # topk_group
+        intermediate_size,
+        0,  # local_expert_offset
+        num_experts,
+        2.5,  # routed_scaling_factor
+        routing_method_type.value,
+        False,  # use_shuffled_weight
+        0,  # weight_layout
+        enable_pdl,
+        activation_type=act_type.value,
+        tune_max_num_tokens=tune_max_num_tokens,
+    ).to(torch.float)
+
+    output = trtllm_mxfp8_block_scale_moe(
+        routing_logits,
+        None,  # routing_bias
+        hidden_states,
+        hidden_states_scale,
+        gemm1_weights,
+        gemm1_weights_scale,
+        gemm2_weights,
+        gemm2_weights_scale,
+        num_experts,
+        top_k,
+        None,  # n_group
+        None,  # topk_group
+        intermediate_size,
+        0,  # local_expert_offset
+        num_experts,
+        None,  # routed_scaling_factor
+        routing_method_type.value,
+        False,  # use_shuffled_weight
+        0,  # weight_layout
+        enable_pdl,
+        activation_type=act_type.value,
+        tune_max_num_tokens=tune_max_num_tokens,
+    ).to(torch.float)
+
+    mask = torch.isclose(output, reference_output, rtol=1e-2, atol=1e-2)
+    mismatch_pct = (~mask).float().mean().item() * 100
+    assert mismatch_pct < 10, f"Mismatch percentage is {mismatch_pct:.2f}%"
+
+
+@pytest.mark.parametrize("num_tokens", [8])
+@pytest.mark.parametrize("hidden_size", [128])
+@pytest.mark.parametrize("intermediate_size", [256])
+@pytest.mark.parametrize("num_experts", [8])
+@pytest.mark.parametrize("top_k", [2])
+def test_trtllm_gen_mxfp8_quant_error_vs_bf16(
+    num_tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+    top_k: int,
+    num_experts: int,
+):
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] not in [10]:
+        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+    torch.manual_seed(42)
+    device = torch.device("cuda:0")
+    enable_pdl = device_support_pdl(device)
+
+    # Relu2 is non-gated: GEMM1 outputs intermediate_size
+    act_type = ActivationType.Relu2
+
+    routing_logits = torch.rand(num_tokens, num_experts, device=device).to(
+        torch.bfloat16
+    )
+    hidden_states_bf16 = (
+        torch.randn(num_tokens, hidden_size, device=device).to(torch.bfloat16) * 0.1
+    )
+    # Non-gated: gemm1 output is intermediate_size (not 2*intermediate_size)
+    gemm1_weights_bf16 = (
+        torch.randn(num_experts, intermediate_size, hidden_size, device=device).to(
+            torch.bfloat16
+        )
+        * 0.1
+    )
+    gemm2_weights_bf16 = (
+        torch.randn(num_experts, hidden_size, intermediate_size, device=device).to(
+            torch.bfloat16
+        )
+        * 0.1
+    )
+
+    # Quantize hidden states to MxFP8 (block size 32)
+    hidden_states, hidden_states_scale = mxfp8_quantize(hidden_states_bf16)
+    gemm1_weights = gemm1_weights_bf16.to(torch.float8_e4m3fn)
+    gemm2_weights = gemm2_weights_bf16.to(torch.float8_e4m3fn)
+
+    # Weight scales: one e8m0 scale per 32 elements along K dimension
+    gemm1_weights_scale = torch.ones(
+        num_experts,
+        intermediate_size,
+        hidden_size // 32,
+        device=device,
+        dtype=torch.uint8,
+    )
+    gemm2_weights_scale = torch.ones(
+        num_experts,
+        hidden_size,
+        intermediate_size // 32,
+        device=device,
+        dtype=torch.uint8,
+    )
+
+    output = trtllm_mxfp8_block_scale_moe(
+        routing_logits,
+        None,  # routing_bias
+        hidden_states,
+        hidden_states_scale,
+        gemm1_weights,
+        gemm1_weights_scale,
+        gemm2_weights,
+        gemm2_weights_scale,
+        num_experts,
+        top_k,
+        1,  # n_group
+        1,  # topk_group
+        intermediate_size,
+        0,  # local_expert_offset
+        num_experts,
+        2.5,  # routed_scaling_factor
+        RoutingMethodType.Renormalize.value,
+        False,  # use_shuffled_weight
+        0,  # weight_layout
+        enable_pdl,
+        activation_type=act_type.value,
+    ).to(torch.float)
+
+    # Verify the output is valid (not NaN/Inf) and kernel ran successfully
+    assert not torch.isnan(output).any(), "Output contains NaN values"
+    assert not torch.isinf(output).any(), "Output contains Inf values"
