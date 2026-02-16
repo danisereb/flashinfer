@@ -202,9 +202,13 @@ class FusedMoeLauncher {
           << "Unsupported weight_layout: " << (int)weight_layout;
     }
     if (which_weights == "gemm1") {
-      TVM_FFI_ICHECK_EQ(Mn % 2, 0) << which_weights << " weights Mn dimension must be even.";
-      TVM_FFI_ICHECK_EQ(args->intermediate_size, Mn / 2)
-          << "intermediate_size has incorrect shape.";
+      if (isGatedActivation(activation_type)) {
+        TVM_FFI_ICHECK_EQ(Mn % 2, 0) << which_weights << " weights Mn dimension must be even.";
+        TVM_FFI_ICHECK_EQ(args->intermediate_size, Mn / 2)
+            << "intermediate_size has incorrect shape.";
+      } else {
+        TVM_FFI_ICHECK_EQ(args->intermediate_size, Mn) << "intermediate_size has incorrect shape.";
+      }
       TVM_FFI_ICHECK_EQ(K, hidden_states.size(1))
           << which_weights << " weights K dimension must be equal to hidden_size.";
     } else if (which_weights == "gemm2") {
