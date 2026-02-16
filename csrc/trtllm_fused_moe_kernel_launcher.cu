@@ -1989,13 +1989,15 @@ Tensor trtllm_fp8_block_scale_moe(
   for (int32_t curr_tile_N : selected_tile_nums) {
     // Create MoE arguments for this launcher
     auto args = std::make_unique<tensorrt_llm::kernels::trtllmgen_moe::MoE::MoERunnerArgs>();
+    bool const use_grouped_routing =
+        static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3;
     args->num_tokens = num_tokens;
     args->num_experts = num_experts;
     args->hidden_size = hidden_size;
     args->hidden_size_output = args->hidden_size;
     args->top_k = top_k;
-    args->n_group = n_group.value_or(0);
-    args->topk_group = topk_group.value_or(0);
+    args->n_group = use_grouped_routing ? n_group.value_or(0) : 0;
+    args->topk_group = use_grouped_routing ? topk_group.value_or(0) : 0;
     args->local_expert_offset = local_expert_offset;
     args->local_num_experts = local_num_experts;
     args->intermediate_size = intermediate_size;
@@ -2087,13 +2089,18 @@ Tensor trtllm_mxfp8_block_scale_moe(
 
   for (int32_t curr_tile_N : selected_tile_nums) {
     auto args = std::make_unique<tensorrt_llm::kernels::trtllmgen_moe::MoE::MoERunnerArgs>();
+    bool const use_grouped_routing =
+        static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3;
     args->num_tokens = num_tokens;
     args->num_experts = num_experts;
     args->hidden_size = hidden_size;
     args->hidden_size_output = output.size(1);
     args->top_k = top_k;
-    args->n_group = n_group.value_or(0);
-    args->topk_group = topk_group.value_or(0);
+    // Grouped routing parameters are only meaningful for DeepSeekV3.
+    // Force non-grouped routing values for all other routing methods to avoid
+    // passing unsupported grouped settings into routing kernels.
+    args->n_group = use_grouped_routing ? n_group.value_or(0) : 0;
+    args->topk_group = use_grouped_routing ? topk_group.value_or(0) : 0;
     args->local_expert_offset = local_expert_offset;
     args->local_num_experts = local_num_experts;
     args->intermediate_size = intermediate_size;
