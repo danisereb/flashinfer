@@ -64,21 +64,31 @@ inline int32_t nextPowerOfTwo(float value) {
 std::set<int32_t> computeSelectedTileN(std::vector<int32_t> const& supported_tile_nums,
                                        int64_t const num_tokens, int64_t const top_k,
                                        int64_t const num_local_experts) {
+  TVM_FFI_ICHECK(!supported_tile_nums.empty())
+      << "supported_tile_nums must not be empty when selecting tile sizes.";
+  TVM_FFI_ICHECK_GT(num_local_experts, 0) << "num_local_experts must be > 0.";
+
+  // Keep selection robust even if the source table is accidentally unsorted.
+  auto sorted_tile_nums = supported_tile_nums;
+  std::sort(sorted_tile_nums.begin(), sorted_tile_nums.end());
+
   float const avg_tokens_per_expert = static_cast<float>(num_tokens * top_k) / num_local_experts;
   // assume supported_tile_nums is sorted
   int32_t tile_tokens_dim = std::clamp(nextPowerOfTwo(avg_tokens_per_expert),
-                                       supported_tile_nums.front(), supported_tile_nums.back());
-  auto it = std::find(supported_tile_nums.begin(), supported_tile_nums.end(), tile_tokens_dim);
+                                       sorted_tile_nums.front(), sorted_tile_nums.back());
+  auto it = std::find(sorted_tile_nums.begin(), sorted_tile_nums.end(), tile_tokens_dim);
+  TVM_FFI_ICHECK(it != sorted_tile_nums.end())
+      << "Selected tile size " << tile_tokens_dim << " is not in supported tile list.";
 
   std::set<int32_t> selected_tile_nums;
   selected_tile_nums.insert(tile_tokens_dim);
-  if (std::next(it) != supported_tile_nums.end()) {
+  if (std::next(it) != sorted_tile_nums.end()) {
     selected_tile_nums.insert(*std::next(it));
-    if (std::next(std::next(it)) != supported_tile_nums.end()) {
+    if (std::next(std::next(it)) != sorted_tile_nums.end()) {
       selected_tile_nums.insert(*std::next(std::next(it)));
     }
   }
-  if (it != supported_tile_nums.begin()) {
+  if (it != sorted_tile_nums.begin()) {
     selected_tile_nums.insert(*std::prev(it));
   }
 
@@ -1017,7 +1027,7 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
 
 class MxFP8BlockScaleLauncher : public FusedMoeLauncher {
  public:
-  static constexpr std::array<int32_t, 7> mSupportedTileNums = {8, 16, 32, 64, 128, 256};
+  static constexpr std::array<int32_t, 6> mSupportedTileNums = {8, 16, 32, 64, 128, 256};
 
   MxFP8BlockScaleLauncher(Optional<TensorView> const& routing_logits,
                           Optional<TensorView> const& routing_bias, TensorView const& hidden_states,
