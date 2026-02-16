@@ -2634,6 +2634,13 @@ def trtllm_mxfp8_block_scale_moe(
     Returns:
         torch.Tensor: Output tensor of shape [seq_len, hidden_size]
     """
+    # Grouped routing is only supported/meaningful for DeepSeekV3 in the current kernels.
+    # For other routing modes, passing n_group/topk_group=1 should be equivalent to no groups,
+    # but some backend paths are sensitive to these values. Normalize to "no groups" here.
+    if int(routing_method_type) != RoutingMethodType.DeepSeekV3.value:
+        n_group = None
+        topk_group = None
+
     output = torch.empty(
         hidden_states.shape, dtype=torch.bfloat16, device=hidden_states.device
     )
