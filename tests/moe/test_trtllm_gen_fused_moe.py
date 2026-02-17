@@ -31,7 +31,7 @@ from flashinfer import (
     reorder_rows_for_gated_act_gemm,
     shuffle_matrix_a,
 )
-from flashinfer.autotuner import autotune
+from flashinfer.autotuner import AutoTuner, autotune
 from flashinfer.fp4_quantization import block_scale_interleave
 from flashinfer.fused_moe import (
     WeightLayout,
@@ -2537,6 +2537,17 @@ def run_moe_test(
     )
 
 
+def _is_fallback_tactic(tactic) -> bool:
+    """Return True if the tactic corresponds to fallback selection."""
+    if isinstance(tactic, int):
+        return tactic == -1
+    try:
+        tactic_vals = [int(x) for x in tactic]
+    except TypeError:
+        return False
+    return len(tactic_vals) > 0 and all(x == -1 for x in tactic_vals)
+
+
 # Test: Renormalize routing
 @pytest.mark.parametrize(
     "zero_hidden_states",
@@ -2881,6 +2892,104 @@ def test_deepseekv3_routing(
         activation_type,
         cache_permute_indices,
     )
+
+
+@pytest.mark.parametrize("num_tokens", [8, 64, 128, 256, 1024, 2048])
+@pytest.mark.parametrize("top_k", [22])
+@pytest.mark.parametrize("intermediate_size", [2688])
+@pytest.mark.parametrize("moe_impl", [FP4Moe(quant_mode=QuantMode.FP4_NVFP4_NVFP4)])
+def test_deepseekv3_fp4_autotune_selects_non_fallback_tactic(
+    num_tokens, top_k, intermediate_size, moe_impl, cache_permute_indices
+):
+    """Validate that autotuning records at least one non-fallback tactic for an actual TRTLLM FP4 MoE config."""
+    hidden_size = 1024
+    routing_config = {
+        "num_experts": 512,
+        "top_k": top_k,
+        "padding": 8,
+        "n_groups": 1,
+        "top_k_groups": 1,
+        "routed_scaling": 2.5,
+        "has_routing_bias": True,
+        "routing_method_type": RoutingMethodType.DeepSeekV3,
+        "compatible_moe_impls": [FP8PerTensorMoe, FP4Moe],
+        "compatible_intermediate_size": [2688],
+        "compatible_activation_types": [ActivationType.Relu2],
+        "enable_autotune": True,
+    }
+    weight_processing = {
+        "use_shuffled_weight": True,
+        "layout": WeightLayout.MajorK,
+        "compatible_moe_impls": [FP4Moe, FP8PerTensorMoe, FP8BlockScaleMoe],
+    }
+    activation_type = ActivationType.Relu2
+
+    skip_checks(
+        moe_impl,
+        routing_config,
+        weight_processing,
+        activation_type,
+        num_tokens,
+        hidden_size,
+        intermediate_size,
+    )
+
+    print("\n" + "-" * 20 + f" {moe_impl=} " + "-" * 20)
+    print(f"Config: {activation_type=}, {top_k=}, {intermediate_size=}, {num_tokens=}")
+
+    tuner = AutoTuner.get()
+    print("[autotune] Clearing autotuner cache...")
+    tuner.clear_cache()
+    tuner.reset_statistics()
+
+    print("Running...")
+
+    run_moe_test(
+        num_tokens,
+        hidden_size,
+        intermediate_size,
+        moe_impl,
+        routing_config,
+        weight_processing,
+        activation_type,
+        cache_permute_indices,
+    )
+
+    op_name = "flashinfer::trtllm_fp4_block_scale_moe"
+    print(f"[autotune] Checking autotuner cache for {op_name}...")
+    op_entries = [
+        (key, runner_id, tactic, profile)
+        for key, (runner_id, tactic, profile) in tuner.profiling_cache.items()
+        if key[0] == op_name
+    ]
+    # print("\n[autotune] Matched tactic cache entries:")
+    # for key, runner_id, tactic, profile in op_entries:
+    #    opt_shapes = profile.get_opt_shapes() if profile is not None else None
+    #    print(
+    #        f"  key={key} runner_id={runner_id} tactic={tactic} "
+    #        f"fallback={_is_fallback_tactic(tactic)} opt_shapes={opt_shapes}"
+    #    )
+    assert len(op_entries) > 0, f"No autotuner cache entries found for {op_name}"
+
+    non_fallback_entries = [
+        (key, runner_id, tactic, profile)
+        for key, runner_id, tactic, profile in op_entries
+        if not _is_fallback_tactic(tactic)
+    ]
+    assert len(non_fallback_entries) > 0, (
+        "All cached tactics are fallback for "
+        f"{op_name}: {[entry[2] for entry in op_entries]}"
+    )
+
+    # Print selected non-fallback tactic details for easy inspection in `pytest -s`.
+    print(
+        f"\n[autotune] Non-fallback tactic entries - found {len(non_fallback_entries)} entries"
+    )
+    # for key, runner_id, tactic, profile in non_fallback_entries:
+    #    opt_shapes = profile.get_opt_shapes() if profile is not None else None
+    #    print(
+    #        f"  key={key} runner_id={runner_id} tactic={tactic} opt_shapes={opt_shapes}"
+    #    )
 
 
 # Test: TopK routing
