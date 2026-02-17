@@ -2994,7 +2994,7 @@ def test_deepseekv3_fp4_autotune_selects_non_fallback_tactic(
 
 @pytest.mark.parametrize("num_tokens", [208, 216, 224])
 def test_deepseekv3_fp4_vllm_fallback_profile_key_repro(num_tokens):
-    """Reproduce vLLM fallback: only the first dynamic input gets remapped in cache key."""
+    """Regression test: all linked dynamic inputs must map to the same tuning bucket."""
 
     def _map_to_prev_pow2(x: int) -> int:
         # Mirrors MoE tuning bucket mapping used by trtllm-gen MoE runners.
@@ -3031,9 +3031,7 @@ def test_deepseekv3_fp4_vllm_fallback_profile_key_repro(num_tokens):
         f"expected_bucket={expected_bucket}, mapped_profile={profile_num_tokens}"
     )
 
-    # Current bug repro: only tensor-0 gets remapped, others keep original num_tokens.
-    assert profile_num_tokens[0] == expected_bucket
-    assert profile_num_tokens[1:] == [num_tokens] * 5
+    assert profile_num_tokens == [expected_bucket] * 6
 
 
 # Test: TopK routing
