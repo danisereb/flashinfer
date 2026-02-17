@@ -2894,7 +2894,20 @@ def test_deepseekv3_routing(
     )
 
 
-@pytest.mark.parametrize("num_tokens", [8, 64, 128, 256, 1024, 2048])
+@pytest.mark.parametrize(
+    "num_tokens",
+    [
+        # power of two
+        8,
+        64,
+        128,
+        256,
+        # non-power of two
+        208,
+        216,
+        224,
+    ],
+)
 @pytest.mark.parametrize("top_k", [22])
 @pytest.mark.parametrize("intermediate_size", [2688])
 @pytest.mark.parametrize("moe_impl", [FP4Moe(quant_mode=QuantMode.FP4_NVFP4_NVFP4)])
