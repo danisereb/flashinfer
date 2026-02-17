@@ -31,7 +31,7 @@ from flashinfer import (
     reorder_rows_for_gated_act_gemm,
     shuffle_matrix_a,
 )
-from flashinfer.autotuner import AutoTuner, autotune
+from flashinfer.autotuner import AutoTuner, DynamicTensorSpec, TuningConfig, autotune
 from flashinfer.fp4_quantization import block_scale_interleave
 from flashinfer.fused_moe import (
     WeightLayout,
@@ -2894,20 +2894,7 @@ def test_deepseekv3_routing(
     )
 
 
-@pytest.mark.parametrize(
-    "num_tokens",
-    [
-        # power of two
-        8,
-        64,
-        128,
-        256,
-        # non-power of two
-        208,
-        216,
-        224,
-    ],
-)
+@pytest.mark.parametrize("num_tokens", [8, 64, 128, 256])
 @pytest.mark.parametrize("top_k", [22])
 @pytest.mark.parametrize("intermediate_size", [2688])
 @pytest.mark.parametrize("moe_impl", [FP4Moe(quant_mode=QuantMode.FP4_NVFP4_NVFP4)])
@@ -3003,6 +2990,50 @@ def test_deepseekv3_fp4_autotune_selects_non_fallback_tactic(
     #    print(
     #        f"  key={key} runner_id={runner_id} tactic={tactic} opt_shapes={opt_shapes}"
     #    )
+
+
+@pytest.mark.parametrize("num_tokens", [208, 216, 224])
+def test_deepseekv3_fp4_vllm_fallback_profile_key_repro(num_tokens):
+    """Reproduce vLLM fallback: only the first dynamic input gets remapped in cache key."""
+
+    def _map_to_prev_pow2(x: int) -> int:
+        # Mirrors MoE tuning bucket mapping used by trtllm-gen MoE runners.
+        return 1 << (x.bit_length() - 1)
+
+    # Mirror trtllm_fp4_block_scale_moe dynamic spec:
+    # num_tokens is shared by input tensors [0..5], dim 0.
+    tuning_config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0, 1, 2, 3, 4, 5),
+                dim_idx=(0, 0, 0, 0, 0, 0),
+                gen_tuning_buckets=(1, 2, 4, 8),
+                map_to_tuning_buckets=_map_to_prev_pow2,
+            ),
+        )
+    )
+
+    input_shapes = (
+        torch.Size([num_tokens, 1024]),
+        torch.Size([num_tokens, 512]),
+        torch.Size([num_tokens, 22]),
+        torch.Size([num_tokens, 22]),
+        torch.Size([num_tokens, 512]),
+        torch.Size([num_tokens, 64]),
+    )
+
+    nearest_profile = AutoTuner._find_nearest_profile(input_shapes, tuning_config)
+    profile_num_tokens = [shape[0] for shape in nearest_profile]
+    expected_bucket = _map_to_prev_pow2(num_tokens)
+
+    print(
+        f"[autotune-key-repro] num_tokens={num_tokens}, "
+        f"expected_bucket={expected_bucket}, mapped_profile={profile_num_tokens}"
+    )
+
+    # Current bug repro: only tensor-0 gets remapped, others keep original num_tokens.
+    assert profile_num_tokens[0] == expected_bucket
+    assert profile_num_tokens[1:] == [num_tokens] * 5
 
 
 # Test: TopK routing
