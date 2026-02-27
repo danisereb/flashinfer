@@ -180,6 +180,7 @@ def hooked_PersistentTileSchedulerParams_init(
     self.cluster_shape_mn = cluster_shape_mnk[:2]
     self.swizzle_size = swizzle_size
     self._raster_along_m = raster_along_m
+    self.raster_along_m = raster_along_m
     self._loc = loc
 
     # Apply swizzle if swizzle_size > 1
@@ -268,11 +269,20 @@ def hooked_PersistentTileSchedulerParams_init(
         self.cluster_shape_n_fdd = cute.fast_divmod_create_divisor(
             cluster_count_n, loc=loc, ip=ip
         )
+        # cluster_shape_major/minor_fdd: aliases expected by cutlass_dsl
+        if raster_along_m:
+            self.cluster_shape_major_fdd = self.cluster_shape_m_fdd
+            self.cluster_shape_minor_fdd = self.cluster_shape_n_fdd
+        else:
+            self.cluster_shape_major_fdd = self.cluster_shape_n_fdd
+            self.cluster_shape_minor_fdd = self.cluster_shape_m_fdd
     else:
         # FastDivmod not applicable with swizzling, set to None
         self.batch_fdd = None
         self.cluster_shape_m_fdd = None
         self.cluster_shape_n_fdd = None
+        self.cluster_shape_major_fdd = None
+        self.cluster_shape_minor_fdd = None
 
 
 def hooked_get_cluster_work_idx_with_fastdivmod(

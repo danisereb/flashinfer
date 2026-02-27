@@ -43,7 +43,9 @@ from .fused_routing_dsv3 import (  # noqa: F401
 # CuteDSL MoE APIs (conditionally imported if cute_dsl available)
 try:
     from .cute_dsl import (
+        CuteDslMoEMxfp8Wrapper,
         cute_dsl_fused_moe_nvfp4,
+        cute_dsl_fused_moe_mxfp8,
         CuteDslMoEWrapper,
     )
 
@@ -78,5 +80,7 @@ __all__ = [
 if _cute_dsl_available:
     __all__ += [
         "cute_dsl_fused_moe_nvfp4",
+        "cute_dsl_fused_moe_mxfp8",
         "CuteDslMoEWrapper",
+        "CuteDslMoEMxfp8Wrapper",
     ]

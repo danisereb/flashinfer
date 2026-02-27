@@ -89,7 +89,9 @@ from .fused_moe import (
 # CuteDSL MoE high-level APIs (conditionally if cute_dsl available)
 with contextlib.suppress(ImportError):
     from .fused_moe import (
+        cute_dsl_fused_moe_mxfp8 as cute_dsl_fused_moe_mxfp8,
         cute_dsl_fused_moe_nvfp4 as cute_dsl_fused_moe_nvfp4,
+        CuteDslMoEMxfp8Wrapper as CuteDslMoEMxfp8Wrapper,
         CuteDslMoEWrapper as CuteDslMoEWrapper,
     )
 from .gdn_prefill import chunk_gated_delta_rule as chunk_gated_delta_rule

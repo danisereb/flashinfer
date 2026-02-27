@@ -202,6 +202,7 @@ def bench_cute_dsl(
     use_cuda_graph=True,
     use_cupti=True,
     use_wrapper=False,
+    quant_mode="nvfp4",
 ):
     """Benchmark CuteDSL MoE.
 
@@ -211,6 +212,7 @@ def bench_cute_dsl(
     """
     from flashinfer.fused_moe import fused_topk_deepseek
     from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
+    from flashinfer.fp8_quantization import mxfp8_quantize
     from flashinfer.fp4_quantization import fp4_quantize
     from flashinfer.testing.utils import bench_gpu_time
 
@@ -223,8 +225,11 @@ def bench_cute_dsl(
     tv = torch.empty(n, CFG.top_k, dtype=torch.float32, device=dev)
     ti = torch.empty(n, CFG.top_k, dtype=torch.int32, device=dev)
 
-    xf, xs = fp4_quantize(inputs["hidden_bf16"], gs1, sv, False, False)
-    xs = xs.unsqueeze(-1)
+    if quant_mode == "mxfp8":
+        xf, xs = mxfp8_quantize(inputs["hidden_bf16"], is_sf_swizzled_layout=True)
+    else:
+        xf, xs = fp4_quantize(inputs["hidden_bf16"], gs1, sv, False, False)
+        xs = xs.unsqueeze(-1)
 
     # Expert range for this EP partition
     expert_start = local_expert_offset
@@ -236,18 +241,25 @@ def bench_cute_dsl(
 
     w1i = interleave(w1_local, 64)
     w1f = w1i.view(num_local_experts * 2 * CFG.intermediate_size, CFG.hidden_size)
-    w1q, w1s = fp4_quantize(w1f, gs1, sv, False, True)
-    w1q = w1q.view(num_local_experts, 2 * CFG.intermediate_size, CFG.hidden_size // 2)
-    w1s = convert_sf_to_mma_layout(
-        w1s, 2 * CFG.intermediate_size, CFG.hidden_size, num_local_experts, sv
-    )
-
     w2f = w2_local.view(num_local_experts * CFG.hidden_size, CFG.intermediate_size)
-    w2q, w2s = fp4_quantize(w2f, gs1, sv, False, True)
-    w2q = w2q.view(num_local_experts, CFG.hidden_size, CFG.intermediate_size // 2)
-    w2s = convert_sf_to_mma_layout(
-        w2s, CFG.hidden_size, CFG.intermediate_size, num_local_experts, sv
-    )
+    if quant_mode == "mxfp8":
+        w1q, w1s = mxfp8_quantize(w1f, is_sf_swizzled_layout=True)
+        w1q = w1q.view(num_local_experts, 2 * CFG.intermediate_size, CFG.hidden_size)
+        w2q, w2s = mxfp8_quantize(w2f, is_sf_swizzled_layout=True)
+        w2q = w2q.view(num_local_experts, CFG.hidden_size, CFG.intermediate_size)
+    else:
+        w1q, w1s = fp4_quantize(w1f, gs1, sv, False, True)
+        w1q = w1q.view(
+            num_local_experts, 2 * CFG.intermediate_size, CFG.hidden_size // 2
+        )
+        w1s = convert_sf_to_mma_layout(
+            w1s, 2 * CFG.intermediate_size, CFG.hidden_size, num_local_experts, sv
+        )
+        w2q, w2s = fp4_quantize(w2f, gs1, sv, False, True)
+        w2q = w2q.view(num_local_experts, CFG.hidden_size, CFG.intermediate_size // 2)
+        w2s = convert_sf_to_mma_layout(
+            w2s, CFG.hidden_size, CFG.intermediate_size, num_local_experts, sv
+        )
 
     # Alpha sized for LOCAL experts only
     alpha, fc2sc = (
@@ -260,9 +272,10 @@ def bench_cute_dsl(
 
     if use_wrapper:
         # Use CuteDslMoEWrapper (recommended for CUDA graph)
-        from flashinfer import CuteDslMoEWrapper
+        from flashinfer import CuteDslMoEMxfp8Wrapper, CuteDslMoEWrapper
 
-        moe = CuteDslMoEWrapper(
+        moe_cls = CuteDslMoEMxfp8Wrapper if quant_mode == "mxfp8" else CuteDslMoEWrapper
+        moe = moe_cls(
             num_experts=CFG.num_experts,
             top_k=CFG.top_k,
             hidden_size=CFG.hidden_size,
@@ -299,7 +312,13 @@ def bench_cute_dsl(
             )
     else:
         # Use functional API
-        from flashinfer import cute_dsl_fused_moe_nvfp4
+        from flashinfer import cute_dsl_fused_moe_mxfp8, cute_dsl_fused_moe_nvfp4
+
+        moe_fn = (
+            cute_dsl_fused_moe_mxfp8
+            if quant_mode == "mxfp8"
+            else cute_dsl_fused_moe_nvfp4
+        )
 
         def run(x, x_sf, router_logits, routing_bias, topk_values, topk_indices):
             fused_topk_deepseek(
@@ -312,7 +331,7 @@ def bench_cute_dsl(
                 topk_values=topk_values,
                 topk_indices=topk_indices,
             )
-            return cute_dsl_fused_moe_nvfp4(
+            return moe_fn(
                 x=x,
                 x_sf=x_sf,
                 token_selected_experts=topk_indices,
@@ -590,7 +609,7 @@ def bench_trtllm(
 # =============================================================================
 
 
-def run_autotune(inputs, verbose=True):
+def run_autotune(inputs, verbose=True, cute_quant_mode="nvfp4"):
     from flashinfer.fused_moe import (
         fused_topk_deepseek,
         cutlass_fused_moe,
@@ -601,9 +620,10 @@ def run_autotune(inputs, verbose=True):
         _maybe_get_cached_w3_w1_permute_indices,
         get_w2_permute_indices_with_cache,
     )
-    from flashinfer import cute_dsl_fused_moe_nvfp4
+    from flashinfer import cute_dsl_fused_moe_mxfp8, cute_dsl_fused_moe_nvfp4
     from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
     from flashinfer.fp4_quantization import fp4_quantize, block_scale_interleave
+    from flashinfer.fp8_quantization import mxfp8_quantize
     from flashinfer.autotuner import autotune
 
     if verbose:
@@ -632,25 +652,36 @@ def run_autotune(inputs, verbose=True):
     if verbose:
         print("Autotuning CuteDSL...")
 
-    xf, xs = fp4_quantize(inputs["hidden_bf16"], gs1, sv, False, False)
-    xs = xs.unsqueeze(-1)
+    if cute_quant_mode == "mxfp8":
+        xf, xs = mxfp8_quantize(inputs["hidden_bf16"], is_sf_swizzled_layout=True)
+    else:
+        xf, xs = fp4_quantize(inputs["hidden_bf16"], gs1, sv, False, False)
+        xs = xs.unsqueeze(-1)
 
     w1i = interleave(inputs["w1_bf16"], 64)
     w1f = w1i.view(CFG.num_experts * 2 * CFG.intermediate_size, CFG.hidden_size)
-    w1q, w1s = fp4_quantize(w1f, gs1, sv, False, True)
-    w1q = w1q.view(CFG.num_experts, 2 * CFG.intermediate_size, CFG.hidden_size // 2)
-    w1s = convert_sf_to_mma_layout(
-        w1s, 2 * CFG.intermediate_size, CFG.hidden_size, CFG.num_experts, sv
-    )
+    if cute_quant_mode == "mxfp8":
+        w1q, w1s = mxfp8_quantize(w1f, is_sf_swizzled_layout=True)
+        w1q = w1q.view(CFG.num_experts, 2 * CFG.intermediate_size, CFG.hidden_size)
+    else:
+        w1q, w1s = fp4_quantize(w1f, gs1, sv, False, True)
+        w1q = w1q.view(CFG.num_experts, 2 * CFG.intermediate_size, CFG.hidden_size // 2)
+        w1s = convert_sf_to_mma_layout(
+            w1s, 2 * CFG.intermediate_size, CFG.hidden_size, CFG.num_experts, sv
+        )
 
     w2f = inputs["w2_bf16"].view(
         CFG.num_experts * CFG.hidden_size, CFG.intermediate_size
     )
-    w2q, w2s = fp4_quantize(w2f, gs1, sv, False, True)
-    w2q = w2q.view(CFG.num_experts, CFG.hidden_size, CFG.intermediate_size // 2)
-    w2s = convert_sf_to_mma_layout(
-        w2s, CFG.hidden_size, CFG.intermediate_size, CFG.num_experts, sv
-    )
+    if cute_quant_mode == "mxfp8":
+        w2q, w2s = mxfp8_quantize(w2f, is_sf_swizzled_layout=True)
+        w2q = w2q.view(CFG.num_experts, CFG.hidden_size, CFG.intermediate_size)
+    else:
+        w2q, w2s = fp4_quantize(w2f, gs1, sv, False, True)
+        w2q = w2q.view(CFG.num_experts, CFG.hidden_size, CFG.intermediate_size // 2)
+        w2s = convert_sf_to_mma_layout(
+            w2s, CFG.hidden_size, CFG.intermediate_size, CFG.num_experts, sv
+        )
 
     alpha, fc2sc = (
         torch.ones(CFG.num_experts, device=dev),
@@ -659,7 +690,12 @@ def run_autotune(inputs, verbose=True):
 
     with autotune(True):
         for _ in range(10):
-            cute_dsl_fused_moe_nvfp4(
+            cute_fn = (
+                cute_dsl_fused_moe_mxfp8
+                if cute_quant_mode == "mxfp8"
+                else cute_dsl_fused_moe_nvfp4
+            )
+            cute_fn(
                 x=xf,
                 x_sf=xs,
                 token_selected_experts=ti,
@@ -827,6 +863,7 @@ def run_benchmark(
     use_cuda_graph=True,
     use_cupti=True,
     use_wrapper=True,
+    cute_quant_mode="nvfp4",
 ):
     """
     Unified benchmark for DeepSeek-V3 MoE backends.
@@ -841,6 +878,7 @@ def run_benchmark(
         use_cuda_graph: Whether to use CUDA graph for benchmarking
         use_cupti: Whether to use CUPTI for accurate GPU timing
         use_wrapper: Whether to use CuteDslMoEWrapper API (recommended)
+        cute_quant_mode: CuteDSL quantization mode ("nvfp4" or "mxfp8")
 
     Returns:
         List of BenchResult objects
@@ -852,11 +890,15 @@ def run_benchmark(
 
     # Run autotune if requested (BEFORE printing header to avoid interleaved output)
     if do_autotune:
-        run_autotune(create_inputs(max(token_counts)), verbose=verbose)
+        run_autotune(
+            create_inputs(max(token_counts)),
+            verbose=verbose,
+            cute_quant_mode=cute_quant_mode,
+        )
 
     # Print header AFTER autotune completes
     if verbose:
-        _print_header(ep_config, num_local, use_cuda_graph, use_cupti)
+        _print_header(ep_config, num_local, use_cuda_graph, use_cupti, cute_quant_mode)
 
     # Run benchmarks
     results = []
@@ -870,6 +912,7 @@ def run_benchmark(
             use_cuda_graph,
             use_cupti,
             use_wrapper=use_wrapper,
+            cute_quant_mode=cute_quant_mode,
         )
         results.extend(row)
         if verbose:
@@ -891,6 +934,7 @@ def _benchmark_single(
     use_cuda_graph,
     use_cupti,
     use_wrapper=True,
+    cute_quant_mode="nvfp4",
 ):
     """Benchmark all backends for a single token count.
 
@@ -910,6 +954,7 @@ def _benchmark_single(
             use_cuda_graph,
             use_cupti,
             use_wrapper=use_wrapper,
+            quant_mode=cute_quant_mode,
         ),
         "CUTLASS": bench_cutlass(
             inputs, warmup, iters, num_local, local_offset, use_cuda_graph, use_cupti
@@ -933,7 +978,7 @@ def _benchmark_single(
     return results
 
 
-def _print_header(ep_config, num_local, use_cuda_graph, use_cupti):
+def _print_header(ep_config, num_local, use_cuda_graph, use_cupti, cute_quant_mode):
     """Print benchmark header."""
     print("\n" + "=" * 100)
     print(f"DeepSeek-V3 MoE Benchmark: CuteDSL vs CUTLASS vs TRTLLM (EP={ep_config})")
@@ -942,6 +987,7 @@ def _print_header(ep_config, num_local, use_cuda_graph, use_cupti):
         f"Model: hidden={CFG.hidden_size}, intermediate={CFG.intermediate_size}, "
         f"experts={CFG.num_experts}, top_k={CFG.top_k}"
     )
+    print(f"CuteDSL quant mode: {cute_quant_mode}")
     print(
         f"EP Config: {num_local} local experts (simulating {CFG.num_experts // num_local}-way parallelism)"
     )
@@ -1037,6 +1083,13 @@ def main():
         action="store_true",
         help="Use functional API instead of CuteDslMoEWrapper for CuteDSL benchmark",
     )
+    parser.add_argument(
+        "--cute-quant-mode",
+        type=str,
+        default="nvfp4",
+        choices=["nvfp4", "mxfp8"],
+        help="Quantization mode for CuteDSL backend",
+    )
     args = parser.parse_args()
 
     if not is_sm100_family():
@@ -1054,6 +1107,7 @@ def main():
     print("\nDeepSeek-V3 MoE Performance Benchmark")
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"CuteDSL API: {'Functional' if args.functional_api else 'Wrapper'}")
+    print(f"CuteDSL quant mode: {args.cute_quant_mode}")
 
     run_benchmark(
         token_counts=tokens,
@@ -1065,6 +1119,7 @@ def main():
         use_cuda_graph=not args.no_cuda_graph,
         use_cupti=not args.no_cupti,
         use_wrapper=not args.functional_api,
+        cute_quant_mode=args.cute_quant_mode,
     )
 
     return 0

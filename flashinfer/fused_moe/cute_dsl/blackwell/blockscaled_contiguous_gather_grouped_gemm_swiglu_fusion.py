@@ -177,6 +177,7 @@ def hooked_PersistentTileSchedulerParams_init(
     self.cluster_shape_mn = cluster_shape_mnk[:2]
     self.swizzle_size = swizzle_size
     self._raster_along_m = raster_along_m
+    self.raster_along_m = raster_along_m
     self._loc = loc
 
     # Apply swizzle if swizzle_size > 1
@@ -265,11 +266,20 @@ def hooked_PersistentTileSchedulerParams_init(
         self.cluster_shape_n_fdd = cute.fast_divmod_create_divisor(
             cluster_count_n, loc=loc, ip=ip
         )
+        # cluster_shape_major/minor_fdd: aliases expected by cutlass_dsl
+        if raster_along_m:
+            self.cluster_shape_major_fdd = self.cluster_shape_m_fdd
+            self.cluster_shape_minor_fdd = self.cluster_shape_n_fdd
+        else:
+            self.cluster_shape_major_fdd = self.cluster_shape_n_fdd
+            self.cluster_shape_minor_fdd = self.cluster_shape_m_fdd
     else:
         # FastDivmod not applicable with swizzling, set to None
         self.batch_fdd = None
         self.cluster_shape_m_fdd = None
         self.cluster_shape_n_fdd = None
+        self.cluster_shape_major_fdd = None
+        self.cluster_shape_minor_fdd = None
 
 
 def hooked_get_cluster_work_idx_with_fastdivmod(
@@ -3512,6 +3522,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         tile_size: cutlass.Constexpr,
         scaling_vector_size: cutlass.Constexpr,
         max_active_clusters: cutlass.Constexpr,
+        generate_sfc: cutlass.Constexpr,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
     ):
@@ -3537,13 +3548,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         c = cute.make_tensor(
             c_ptr, layout=cute.make_ordered_layout((m, interm_size, 1), order=(1, 0, 2))
         )
-        c_sf = cute.make_tensor(
-            c_sf_ptr,
-            layout=cute.make_ordered_layout(
-                (32, 4, m // 128, 4, interm_size // (scaling_vector_size * 4), l),
-                order=(2, 1, 4, 0, 3, 5),
-            ),
-        )
         alpha = cute.make_tensor(alpha_ptr, layout=cute.make_layout((l,)))
 
         tile_idx_to_group_idx = cute.make_tensor(
@@ -3558,7 +3562,22 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         num_non_exiting_tiles = cute.make_tensor(
             num_non_exiting_tiles_ptr, layout=cute.make_layout((1,))
         )
-        global_sf = cute.make_tensor(global_sf_ptr, layout=cute.make_layout((1,)))
+
+        # Only create c_sf / global_sf tensors when FP4 output quantization
+        # is requested.  When generate_sfc is False (e.g. MXFP8 with BF16
+        # output), pass None so the kernel skips the SFC epilogue path.
+        if cutlass.const_expr(generate_sfc):
+            c_sf = cute.make_tensor(
+                c_sf_ptr,
+                layout=cute.make_ordered_layout(
+                    (32, 4, m // 128, 4, interm_size // (scaling_vector_size * 4), l),
+                    order=(2, 1, 4, 0, 3, 5),
+                ),
+            )
+            global_sf = cute.make_tensor(global_sf_ptr, layout=cute.make_layout((1,)))
+        else:
+            c_sf = None
+            global_sf = None
 
         return self(
             a,

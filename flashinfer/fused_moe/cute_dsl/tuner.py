@@ -404,6 +404,15 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         )
 
 
+class CuteDslFusedMoEMxfp8Runner(CuteDslFusedMoENvfp4Runner):
+    """Phase-1 runner scaffold for CuteDSL MXFP8 fused MoE.
+
+    The tactic space and dynamic tensor bucketing are expected to stay aligned
+    with NVFP4 initially. Kernel-specific execution is wired in
+    `fused_moe.py` as MXFP8 support lands.
+    """
+
+
 # =============================================================================
 # Utility Functions
 # =============================================================================

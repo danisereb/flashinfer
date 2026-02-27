@@ -57,6 +57,30 @@ from cutlass.pipeline import (
     agent_sync,
 )
 
+# ---------------------------------------------------------------------------
+# Monkey-patch: ensure _make_sync_object accepts TCGen05Mma.
+# nvidia_cutlass_dsl >=4.4.0 dropped TCGen05Mma from the accepted list in
+# _make_sync_object, but the pipeline *behaviour* still requires it for
+# correct barrier arrive/wait semantics in PipelineTmaUmma and
+# PipelineUmmaEpilogue.  TCGen05Mma maps to the same MbarrierArray as
+# AsyncThread/TmaLoad, so adding it back is safe.
+# ---------------------------------------------------------------------------
+_orig_make_sync_object = PipelineAsync._make_sync_object
+
+
+def _patched_make_sync_object(
+    barrier_storage,
+    num_stages,
+    agent,
+    tx_count=0,  # noqa: ANN001
+):
+    if agent[0] is PipelineOp.TCGen05Mma:
+        agent = (PipelineOp.AsyncThread, agent[1])
+    return _orig_make_sync_object(barrier_storage, num_stages, agent, tx_count)
+
+
+PipelineAsync._make_sync_object = staticmethod(_patched_make_sync_object)
+
 
 def pipeline_init_wait(cta_layout_vmnk: Optional[cute.Layout] = None):
     """Initializes the mbarrier and synchronizes the threadblock or cluster.
@@ -486,8 +510,12 @@ class PipelineCpAsyncUmma(PipelineAsync):
                 f"Expected barrier_storage to be a cute.Pointer, but got {type(barrier_storage)}"
             )
 
-        producer_type = PipelineOp.AsyncLoad
-        consumer_type = PipelineOp.TCGen05Mma
+        # Use AsyncThread for both producer and consumer for compatibility
+        # with nvidia_cutlass_dsl versions where _make_sync_object does not
+        # recognise AsyncLoad or TCGen05Mma.  All three map to the same
+        # MbarrierArray sync object, so the behaviour is identical.
+        producer_type = PipelineOp.AsyncThread
+        consumer_type = PipelineOp.AsyncThread
 
         producer = (producer_type, producer_group)
         consumer = (consumer_type, consumer_group)

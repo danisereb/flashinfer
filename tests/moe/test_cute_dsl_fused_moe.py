@@ -302,6 +302,95 @@ def create_moe_tensors(
     }
 
 
+def create_moe_tensors_mxfp8(
+    num_tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    num_local_experts: int,
+    top_k: int,
+    is_gated: bool = True,
+    device: str = "cuda",
+    seed: int = 42,
+):
+    """Create MXFP8 MoE tensors for CuteDSL API path tests."""
+    from flashinfer.fp8_quantization import mxfp8_quantize
+
+    torch.manual_seed(seed)
+
+    x_bf16 = (
+        torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device) / 10
+    )
+    x_q, x_sf = mxfp8_quantize(x_bf16, is_sf_swizzled_layout=True)
+
+    router_logits = torch.randn(num_tokens, num_experts, device=device)
+    routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+    routing_weights, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
+    routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
+    routing_weights = routing_weights.float()
+    selected_experts = selected_experts.to(torch.int32)
+
+    w1_bf16 = (
+        torch.randn(
+            num_local_experts,
+            (2 * intermediate_size) if is_gated else intermediate_size,
+            hidden_size,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        / 10
+    )
+    w1_bf16_interleaved = (
+        interleave_linear_and_gate(w1_bf16, group_size=64, dim=1)
+        if is_gated
+        else w1_bf16
+    )
+    w1_flat = w1_bf16_interleaved.view(num_local_experts * 2 * intermediate_size, -1)
+    if not is_gated:
+        w1_flat = w1_bf16_interleaved.view(num_local_experts * intermediate_size, -1)
+    w1_q_flat, w1_sf_flat = mxfp8_quantize(w1_flat, is_sf_swizzled_layout=True)
+    w1_q = w1_q_flat.view(
+        num_local_experts,
+        (2 * intermediate_size) if is_gated else intermediate_size,
+        hidden_size,
+    )
+    w1_sf = w1_sf_flat
+    w1_alpha = torch.ones(num_local_experts, dtype=torch.float32, device=device)
+
+    w2_bf16 = (
+        torch.randn(
+            num_local_experts,
+            hidden_size,
+            intermediate_size,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        / 10
+    )
+    w2_flat = w2_bf16.view(num_local_experts * hidden_size, intermediate_size)
+    w2_q_flat, w2_sf_flat = mxfp8_quantize(w2_flat, is_sf_swizzled_layout=True)
+    w2_q = w2_q_flat.view(num_local_experts, hidden_size, intermediate_size)
+    w2_sf = w2_sf_flat
+    w2_alpha = torch.ones(num_local_experts, dtype=torch.float32, device=device)
+
+    return {
+        "x": x_q,
+        "x_sf": x_sf,
+        "x_bf16": x_bf16,
+        "token_selected_experts": selected_experts,
+        "token_final_scales": routing_weights,
+        "w1_weight": w1_q,
+        "w1_weight_sf": w1_sf,
+        "w1_weight_bf16": w1_bf16,
+        "w1_alpha": w1_alpha,
+        "fc2_input_scale": torch.tensor([1.0], device=device, dtype=torch.float32),
+        "w2_weight": w2_q,
+        "w2_weight_sf": w2_sf,
+        "w2_weight_bf16": w2_bf16,
+        "w2_alpha": w2_alpha,
+    }
+
+
 def check_accuracy(
     actual: torch.Tensor, expected: torch.Tensor, percent_threshold: float = 0.97
 ):
@@ -923,6 +1012,660 @@ class TestExpertParallelism:
         assert passed, (
             f"EP functional API accuracy test failed (ep_size={ep_size}, ep_rank={ep_rank}): "
             f"{percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
+        )
+
+
+def compute_reference_moe_mxfp8(
+    hidden_states_bf16: torch.Tensor,
+    gemm1_weights_bf16: torch.Tensor,
+    gemm2_weights_bf16: torch.Tensor,
+    token_selected_experts: torch.Tensor,
+    token_final_scales: torch.Tensor,
+    num_tokens: int,
+    num_experts: int,
+    top_k: int,
+    hidden_size: int,
+    intermediate_size: int,
+    is_gated: bool = True,
+    num_local_experts: int = None,
+    local_expert_offset: int = 0,
+) -> torch.Tensor:
+    """Compute reference MoE output for MXFP8 using BF16 weights (pre-quantization).
+
+    Applies the same expert routing logic as the kernel, but using the
+    original BF16 weights for a numerically accurate reference.
+
+    Args:
+        hidden_states_bf16: Original BF16 input [num_tokens, hidden_size]
+        gemm1_weights_bf16: Original BF16 GEMM1 weights
+            gated:     [num_local_experts, 2*intermediate_size, hidden_size]
+            non-gated: [num_local_experts, intermediate_size, hidden_size]
+        gemm2_weights_bf16: Original BF16 GEMM2 weights [num_local_experts, hidden_size, intermediate_size]
+        token_selected_experts: Selected expert IDs (global) [num_tokens, top_k]
+        token_final_scales: Routing weights [num_tokens, top_k]
+        num_tokens: Number of tokens
+        num_experts: Total number of experts (global)
+        top_k: Number of experts per token
+        hidden_size: Hidden dimension
+        intermediate_size: Intermediate dimension
+        is_gated: Whether to use gated (SwiGLU) activation
+        num_local_experts: Number of local experts (for EP). Defaults to num_experts.
+        local_expert_offset: Starting expert ID for this EP rank. Defaults to 0.
+
+    Returns:
+        Output tensor [num_tokens, hidden_size] in float32.
+    """
+    if num_local_experts is None:
+        num_local_experts = num_experts
+
+    device = hidden_states_bf16.device
+    hidden_states = hidden_states_bf16.float()
+    gemm1_weights = gemm1_weights_bf16.float()
+    gemm2_weights = gemm2_weights_bf16.float()
+
+    output = torch.zeros((num_tokens, hidden_size), dtype=torch.float32, device=device)
+
+    for token_idx in range(num_tokens):
+        token_input = hidden_states[token_idx : token_idx + 1]  # [1, H]
+
+        for k in range(top_k):
+            expert_idx = token_selected_experts[token_idx, k].item()
+            scale = token_final_scales[token_idx, k].item()
+
+            if expert_idx < 0 or expert_idx >= num_experts:
+                continue
+
+            local_idx = expert_idx - local_expert_offset
+            if local_idx < 0 or local_idx >= num_local_experts:
+                continue
+
+            w1 = gemm1_weights[local_idx]  # [2I, H] or [I, H]
+            gemm1_out = token_input @ w1.T  # [1, 2I] or [1, I]
+
+            if is_gated:
+                # SwiGLU: the interleaved layout means we need to
+                # use the first half as linear and second half as gate
+                linear = gemm1_out[:, :intermediate_size]
+                gate = gemm1_out[:, intermediate_size:]
+                act_out = silu(gate) * linear  # [1, I]
+            else:
+                # ReLU^2
+                act_out = torch.relu(gemm1_out) ** 2  # [1, I]
+
+            w2 = gemm2_weights[local_idx]  # [H, I]
+            gemm2_out = act_out @ w2.T  # [1, H]
+
+            output[token_idx] += scale * gemm2_out.squeeze(0)
+
+    return output
+
+
+def _assert_valid_moe_output(
+    result: torch.Tensor,
+    num_tokens: int,
+    hidden_size: int,
+    label: str = "",
+):
+    """Assert that a MoE output tensor is valid (shape, dtype, no NaN/Inf/all-zero)."""
+    prefix = f"[{label}] " if label else ""
+    assert result.shape == (num_tokens, hidden_size), (
+        f"{prefix}Expected shape ({num_tokens}, {hidden_size}), got {tuple(result.shape)}"
+    )
+    assert result.dtype == torch.bfloat16, (
+        f"{prefix}Expected dtype bfloat16, got {result.dtype}"
+    )
+    nan_count = torch.isnan(result).sum().item()
+    assert nan_count == 0, (
+        f"{prefix}Found {nan_count} NaN values out of {result.numel()} elements "
+        f"({nan_count / result.numel() * 100:.2f}%)"
+    )
+    inf_count = torch.isinf(result).sum().item()
+    assert inf_count == 0, (
+        f"{prefix}Found {inf_count} Inf values out of {result.numel()} elements "
+        f"({inf_count / result.numel() * 100:.2f}%)"
+    )
+    assert not (result == 0).all(), (
+        f"{prefix}Output is all zeros - kernel may not have produced any output"
+    )
+
+
+def check_accuracy_mxfp8(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    percent_threshold: float = 0.90,
+):
+    """Check MXFP8 numerical accuracy with percentage-based tolerance.
+
+    MXFP8 has tighter precision than FP4, so tolerances are slightly smaller,
+    but still looser than full-precision due to E8M0 block scaling noise.
+    """
+    actual = actual.float()
+    expected = expected.float()
+
+    output_scale = max(expected.std().item(), 0.01)
+    atol = max(0.1, 2.0 * output_scale)
+    rtol = 0.5
+
+    abs_diff = torch.abs(actual - expected)
+    rel_diff = abs_diff / (torch.abs(expected) + 1e-8)
+    within_tolerance = (abs_diff < atol) | (rel_diff < rtol)
+    percent_within = within_tolerance.float().mean().item()
+
+    return percent_within >= percent_threshold, percent_within, atol
+
+
+# =============================================================================
+# Test Class: MXFP8 MoE (CuteDSL)
+# =============================================================================
+
+
+@cute_dsl_available
+@sm100_required
+class TestCuteDslMxfp8ApiPath:
+    """API path checks for MXFP8 CuteDSL MoE: functional and wrapper consistency."""
+
+    @pytest.mark.parametrize("is_gated", [True, False], ids=["gated", "non_gated"])
+    def test_functional_and_wrapper_run(self, is_gated: bool):
+        """Functional vs wrapper: shape, dtype, no NaN/Inf, mutual consistency."""
+        from flashinfer import CuteDslMoEMxfp8Wrapper, cute_dsl_fused_moe_mxfp8
+
+        num_tokens, hidden_size, intermediate_size = 128, 256, 512
+        num_experts, top_k = 8, 2
+
+        tensors = create_moe_tensors_mxfp8(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+            is_gated=is_gated,
+        )
+
+        out_fn = cute_dsl_fused_moe_mxfp8(
+            x=tensors["x"],
+            x_sf=tensors["x_sf"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            num_experts=num_experts,
+            top_k=top_k,
+            is_gated=is_gated,
+        )
+
+        wrapper = CuteDslMoEMxfp8Wrapper(
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            use_cuda_graph=False,
+            is_gated=is_gated,
+        )
+        out_wrapper = wrapper.run(
+            x=tensors["x"],
+            x_sf=tensors["x_sf"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+        )
+
+        _assert_valid_moe_output(out_fn, num_tokens, hidden_size, "functional")
+        _assert_valid_moe_output(out_wrapper, num_tokens, hidden_size, "wrapper")
+        torch.testing.assert_close(
+            out_fn.float(), out_wrapper.float(), rtol=1e-2, atol=2e-2
+        )
+
+
+@cute_dsl_available
+@sm100_required
+class TestCuteDslMxfp8Accuracy:
+    """Numerical accuracy tests for MXFP8 MoE against BF16 reference."""
+
+    @pytest.mark.parametrize(
+        "hidden_size,intermediate_size",
+        [(256, 512), (1024, 1024)],
+    )
+    @pytest.mark.parametrize("top_k", [1, 2, 8])
+    @pytest.mark.parametrize("num_tokens", [128, 512])
+    @pytest.mark.parametrize("num_experts", [8])
+    def test_gated_numerical_accuracy(
+        self,
+        num_tokens: int,
+        top_k: int,
+        hidden_size: int,
+        intermediate_size: int,
+        num_experts: int,
+    ):
+        """Gated (SwiGLU) MXFP8 MoE accuracy against BF16 reference."""
+        from flashinfer import cute_dsl_fused_moe_mxfp8
+
+        tensors = create_moe_tensors_mxfp8(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+            is_gated=True,
+        )
+
+        result = cute_dsl_fused_moe_mxfp8(
+            x=tensors["x"],
+            x_sf=tensors["x_sf"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            num_experts=num_experts,
+            top_k=top_k,
+            is_gated=True,
+        )
+
+        _assert_valid_moe_output(result, num_tokens, hidden_size, "gated_mxfp8")
+
+        ref_output = compute_reference_moe_mxfp8(
+            hidden_states_bf16=tensors["x_bf16"].cuda(),
+            gemm1_weights_bf16=tensors["w1_weight_bf16"].cuda(),
+            gemm2_weights_bf16=tensors["w2_weight_bf16"].cuda(),
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            is_gated=True,
+        )
+
+        passed, percent_within, atol = check_accuracy_mxfp8(result, ref_output)
+        assert passed, (
+            f"Gated MXFP8 accuracy: only {percent_within * 100:.2f}% within "
+            f"tolerance (atol={atol:.4f}), config: "
+            f"tokens={num_tokens} H={hidden_size} I={intermediate_size} "
+            f"E={num_experts} top_k={top_k}"
+        )
+
+    @pytest.mark.parametrize(
+        "hidden_size,intermediate_size",
+        [(256, 512), (1024, 1024)],
+    )
+    @pytest.mark.parametrize("num_tokens", [128, 512])
+    @pytest.mark.parametrize("num_experts", [8])
+    def test_non_gated_numerical_accuracy(
+        self,
+        num_tokens: int,
+        hidden_size: int,
+        intermediate_size: int,
+        num_experts: int,
+    ):
+        """Non-gated (ReLU^2) MXFP8 MoE accuracy against BF16 reference."""
+        from flashinfer import cute_dsl_fused_moe_mxfp8
+
+        top_k = 2
+
+        tensors = create_moe_tensors_mxfp8(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+            is_gated=False,
+        )
+
+        result = cute_dsl_fused_moe_mxfp8(
+            x=tensors["x"],
+            x_sf=tensors["x_sf"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            num_experts=num_experts,
+            top_k=top_k,
+            is_gated=False,
+        )
+
+        _assert_valid_moe_output(result, num_tokens, hidden_size, "non_gated_mxfp8")
+
+        ref_output = compute_reference_moe_mxfp8(
+            hidden_states_bf16=tensors["x_bf16"].cuda(),
+            gemm1_weights_bf16=tensors["w1_weight_bf16"].cuda(),
+            gemm2_weights_bf16=tensors["w2_weight_bf16"].cuda(),
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            is_gated=False,
+        )
+
+        passed, percent_within, atol = check_accuracy_mxfp8(result, ref_output)
+        assert passed, (
+            f"Non-gated MXFP8 accuracy: only {percent_within * 100:.2f}% within "
+            f"tolerance (atol={atol:.4f}), config: "
+            f"tokens={num_tokens} H={hidden_size} I={intermediate_size} "
+            f"E={num_experts} top_k={top_k}"
+        )
+
+    def test_deterministic_across_runs(self):
+        """Verify that repeated calls produce consistent results (no uninitialized memory)."""
+        from flashinfer import cute_dsl_fused_moe_mxfp8
+
+        num_tokens, hidden_size, intermediate_size = 128, 256, 512
+        num_experts, top_k = 8, 2
+
+        tensors = create_moe_tensors_mxfp8(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+            is_gated=True,
+        )
+
+        kwargs = dict(
+            x=tensors["x"],
+            x_sf=tensors["x_sf"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            num_experts=num_experts,
+            top_k=top_k,
+            is_gated=True,
+        )
+
+        results = []
+        for i in range(3):
+            out = cute_dsl_fused_moe_mxfp8(**kwargs)
+            _assert_valid_moe_output(out, num_tokens, hidden_size, f"run_{i}")
+            results.append(out.clone())
+
+        for i in range(1, len(results)):
+            max_diff = (results[0].float() - results[i].float()).abs().max().item()
+            assert max_diff < 0.5, (
+                f"Run {i} differs from run 0 by max_diff={max_diff:.6f}, "
+                "possible uninitialized memory"
+            )
+
+
+@cute_dsl_available
+@sm100_required
+class TestCuteDslMxfp8ExpertParallelism:
+    """Expert parallelism (EP) tests for MXFP8 CuteDSL MoE."""
+
+    @pytest.mark.parametrize("ep_size", [1, 4])
+    def test_ep_no_nan(self, ep_size: int):
+        """EP partitioned MXFP8 MoE: no NaN, no Inf, not all zeros."""
+        from flashinfer import CuteDslMoEMxfp8Wrapper
+
+        ep_rank = 0
+        num_tokens, hidden_size, intermediate_size = 128, 256, 512
+        num_experts, top_k = 8, 2
+        num_local_experts = num_experts // ep_size
+        local_expert_offset = ep_rank * num_local_experts
+
+        tensors = create_moe_tensors_mxfp8(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_local_experts,
+            top_k=top_k,
+            is_gated=True,
+        )
+
+        wrapper = CuteDslMoEMxfp8Wrapper(
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_local_experts=num_local_experts,
+            local_expert_offset=local_expert_offset,
+            use_cuda_graph=False,
+            is_gated=True,
+        )
+
+        result = wrapper.run(
+            x=tensors["x"],
+            x_sf=tensors["x_sf"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+        )
+
+        _assert_valid_moe_output(
+            result,
+            num_tokens,
+            hidden_size,
+            f"ep_size={ep_size}_rank={ep_rank}",
+        )
+
+        # Accuracy check against reference
+        ref_output = compute_reference_moe_mxfp8(
+            hidden_states_bf16=tensors["x_bf16"].cuda(),
+            gemm1_weights_bf16=tensors["w1_weight_bf16"].cuda(),
+            gemm2_weights_bf16=tensors["w2_weight_bf16"].cuda(),
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            is_gated=True,
+            num_local_experts=num_local_experts,
+            local_expert_offset=local_expert_offset,
+        )
+
+        passed, percent_within, atol = check_accuracy_mxfp8(result, ref_output)
+        assert passed, (
+            f"EP accuracy (ep_size={ep_size}, rank={ep_rank}): "
+            f"{percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
+        )
+
+
+@cute_dsl_available
+@sm100_required
+class TestCuteDslMxfp8CudaGraph:
+    """CUDA graph capture and replay tests for MXFP8 CuteDSL MoE."""
+
+    @pytest.mark.parametrize("num_tokens", [64, 256])
+    def test_cuda_graph_capture_replay(self, num_tokens: int):
+        """Verify CUDA graph capture and replay produce valid, consistent results."""
+        from flashinfer import CuteDslMoEMxfp8Wrapper
+
+        hidden_size, intermediate_size = 256, 512
+        num_experts, top_k = 8, 2
+
+        tensors = create_moe_tensors_mxfp8(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+            is_gated=True,
+        )
+
+        wrapper = CuteDslMoEMxfp8Wrapper(
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            use_cuda_graph=True,
+            max_num_tokens=num_tokens,
+            is_gated=True,
+        )
+
+        run_kwargs = dict(
+            x=tensors["x"],
+            x_sf=tensors["x_sf"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+        )
+
+        # Warmup
+        for _ in range(3):
+            wrapper.run(**run_kwargs)
+        torch.cuda.synchronize()
+
+        # Capture
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            output = wrapper.run(**run_kwargs)
+        torch.cuda.synchronize()
+
+        assert output.shape == (num_tokens, hidden_size)
+
+        # First replay
+        g.replay()
+        torch.cuda.synchronize()
+
+        _assert_valid_moe_output(output, num_tokens, hidden_size, "cuda_graph_replay")
+
+        # Replay consistency
+        replays = []
+        for _ in range(3):
+            g.replay()
+            torch.cuda.synchronize()
+            replays.append(output.clone())
+
+        for i in range(1, len(replays)):
+            max_diff = (replays[0].float() - replays[i].float()).abs().max().item()
+            assert max_diff < 0.5, (
+                f"CUDA graph replay {i} differs too much: max_diff={max_diff}"
+            )
+
+
+@cute_dsl_available
+@sm100_required
+class TestCuteDslMxfp8Autotune:
+    """Auto-tune integration tests for MXFP8 CuteDSL MoE."""
+
+    def test_autotune_functional(self):
+        """Run functional API under autotune and verify output validity."""
+        from flashinfer import autotune, cute_dsl_fused_moe_mxfp8
+
+        num_tokens, hidden_size, intermediate_size = 128, 256, 512
+        num_experts, top_k = 8, 2
+
+        tensors = create_moe_tensors_mxfp8(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+            is_gated=True,
+        )
+
+        with autotune(True):
+            result = cute_dsl_fused_moe_mxfp8(
+                x=tensors["x"],
+                x_sf=tensors["x_sf"],
+                token_selected_experts=tensors["token_selected_experts"],
+                token_final_scales=tensors["token_final_scales"],
+                w1_weight=tensors["w1_weight"],
+                w1_weight_sf=tensors["w1_weight_sf"],
+                w1_alpha=tensors["w1_alpha"],
+                fc2_input_scale=tensors["fc2_input_scale"],
+                w2_weight=tensors["w2_weight"],
+                w2_weight_sf=tensors["w2_weight_sf"],
+                w2_alpha=tensors["w2_alpha"],
+                num_experts=num_experts,
+                top_k=top_k,
+                is_gated=True,
+            )
+
+        _assert_valid_moe_output(result, num_tokens, hidden_size, "autotune_mxfp8")
+
+    def test_autotune_wrapper(self):
+        """Run wrapper API under autotune and verify output validity."""
+        from flashinfer import autotune, CuteDslMoEMxfp8Wrapper
+
+        num_tokens, hidden_size, intermediate_size = 128, 256, 512
+        num_experts, top_k = 8, 2
+
+        tensors = create_moe_tensors_mxfp8(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+            is_gated=True,
+        )
+
+        wrapper = CuteDslMoEMxfp8Wrapper(
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            use_cuda_graph=False,
+            is_gated=True,
+        )
+
+        with autotune(True):
+            result = wrapper.run(
+                x=tensors["x"],
+                x_sf=tensors["x_sf"],
+                token_selected_experts=tensors["token_selected_experts"],
+                token_final_scales=tensors["token_final_scales"],
+                w1_weight=tensors["w1_weight"],
+                w1_weight_sf=tensors["w1_weight_sf"],
+                w1_alpha=tensors["w1_alpha"],
+                fc2_input_scale=tensors["fc2_input_scale"],
+                w2_weight=tensors["w2_weight"],
+                w2_weight_sf=tensors["w2_weight_sf"],
+                w2_alpha=tensors["w2_alpha"],
+            )
+
+        _assert_valid_moe_output(
+            result, num_tokens, hidden_size, "autotune_wrapper_mxfp8"
         )
 
 

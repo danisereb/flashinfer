@@ -20,7 +20,9 @@ from ...cute_dsl.utils import is_cute_dsl_available
 # Conditionally import CuTe-DSL kernels
 if is_cute_dsl_available():
     from .fused_moe import (
+        CuteDslMoEMxfp8Wrapper,
         cute_dsl_fused_moe_nvfp4,
+        cute_dsl_fused_moe_mxfp8,
         CuteDslMoEWrapper,
     )
 
@@ -31,5 +33,7 @@ __all__ = [
 if is_cute_dsl_available():
     __all__ += [
         "cute_dsl_fused_moe_nvfp4",
+        "cute_dsl_fused_moe_mxfp8",
         "CuteDslMoEWrapper",
+        "CuteDslMoEMxfp8Wrapper",
     ]

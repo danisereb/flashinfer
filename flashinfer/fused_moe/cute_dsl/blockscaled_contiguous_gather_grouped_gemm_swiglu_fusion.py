@@ -268,6 +268,7 @@ def _get_compiled_gather_kernel(
         #  tile_idx_to_group_idx_ptr, tile_idx_to_mn_limit_ptr, token_id_mapping_ptr,
         #  num_non_exiting_tiles_ptr, global_sf_ptr, orig_m, m, n, k, l,
         #  tile_size, scaling_vector_size, max_active_clusters, stream)
+        _generate_sfc = c_dtype == "float4_e2m1fn"
         compiled_gemm = cute.compile(
             gemm.wrapper,
             a_ptr,
@@ -290,6 +291,7 @@ def _get_compiled_gather_kernel(
             tile_size=tile_size,
             scaling_vector_size=sf_vec_size,
             max_active_clusters=max_active_clusters,
+            generate_sfc=_generate_sfc,
             stream=stream,
         )
 
