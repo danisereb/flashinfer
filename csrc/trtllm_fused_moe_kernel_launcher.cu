@@ -1534,9 +1534,17 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
 
   void prepare_routing() override {
     num_tokens_per_expert = alloc_tensor({args->num_experts}, dl_int32, hidden_states.device());
+    // Use `local_num_experts` (not global `num_experts`) for permuted-buffer / CTA-batch sizing.
+    // On EP > 1 ranks, only tokens routed to the local expert range can ever land here; the
+    // routing kernel only writes `permuted_idx_to_token_idx` / `cta_idx_xy_to_*` for local
+    // experts (see RoutingKernel.cuh: `isLocalExpert` guard) and the GEMM runners launch with
+    // `getMaxNumCtasInBatchDim(args.local_num_experts, ...)` (see trtllm_fused_moe_runner.cu
+    // `MoE::Runner::run` -> PermuteGemm1/Gemm2 `Runner::run`). Sizing these buffers for global
+    // `num_experts` was over-allocation that the kernel could never index, costing ~2 GiB+ on
+    // wide-EP configs (e.g. 512 global / 16 local) without functional benefit.
     int32_t max_num_padded_tokens =
         tensorrt_llm::kernels::trtllmgen_moe::Routing::getMaxPermutedPaddedCount(
-            args->num_tokens, args->top_k, args->num_experts, tile_tokens_dim);
+            args->num_tokens, args->top_k, args->local_num_experts, tile_tokens_dim);
 
     total_num_padded_tokens = alloc_tensor({1}, dl_int32, hidden_states.device());
     expanded_idx_to_permuted_idx =
@@ -1544,12 +1552,15 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     permuted_idx_to_token_idx =
         alloc_tensor({max_num_padded_tokens}, dl_int32, hidden_states.device());
 
+    // `expert_count_histogram` must stay sized for global `num_experts`: the routing kernel
+    // writes per-expert counts for *all* experts (zero counts for non-local), and the
+    // `expert_count_histogram` tensor is the destination for that global histogram.
     int64_t const size_of_expert_count_histogram = std::max(args->num_experts * 2, 256 * 2);
     expert_count_histogram =
         alloc_tensor({size_of_expert_count_histogram}, dl_int32, hidden_states.device());
 
     int32_t max_num_ctas = tensorrt_llm::kernels::trtllmgen_moe::Routing::getMaxNumCtasInBatchDim(
-        args->num_tokens, args->top_k, args->num_experts, tile_tokens_dim);
+        args->num_tokens, args->top_k, args->local_num_experts, tile_tokens_dim);
     cta_idx_xy_to_batch_idx = alloc_tensor({max_num_ctas}, dl_int32, hidden_states.device());
     cta_idx_xy_to_mn_limit = alloc_tensor({max_num_ctas}, dl_int32, hidden_states.device());
     num_non_exiting_ctas = alloc_tensor({1}, dl_int32, hidden_states.device());
