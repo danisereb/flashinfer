@@ -107,6 +107,23 @@ def validate_cute_dsl_moe_situ_config(
         )
 
 
+def validate_cute_dsl_moe_relu2_softclamp(
+    activation_type: ActivationType,
+    relu2_softclamp: Optional[float],
+) -> None:
+    """Validate the optional smooth clamp of the non-gated ReLU^2 epilogue.
+
+    When set, the FC1 accumulator is mapped through ``c * tanh(x / c)`` before
+    the ReLU^2, i.e. ``relu(c * tanh(x / c)) ** 2``.
+    """
+    if relu2_softclamp is None:
+        return
+    if activation_type != ActivationType.Relu2:
+        raise ValueError("relu2_softclamp requires ActivationType.Relu2")
+    if not math.isfinite(relu2_softclamp) or relu2_softclamp <= 0:
+        raise ValueError("relu2_softclamp must be positive and finite when set")
+
+
 def get_max_num_tiles(
     num_tokens: int,
     top_k: int,

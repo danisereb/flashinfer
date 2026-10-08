@@ -57,6 +57,7 @@ from .blackwell.moe_w4a16 import launch_w4a16_moe
 from .blackwell.moe_w4a16_kernel import Sm100W4A16GroupedGemmKernel
 from .moe_utils import (
     normalize_cute_dsl_moe_activation_type,
+    validate_cute_dsl_moe_relu2_softclamp,
     validate_cute_dsl_moe_situ_config,
 )
 
@@ -515,14 +516,18 @@ class CuteDslFusedMoERunner(TunableRunner):
         localized_streams: Optional[list] = None,
         localized_sm_count: Optional[int] = None,
         localized_memset_stream: Optional[torch.cuda.Stream] = None,
+        relu2_softclamp: Optional[float] = None,
     ):
         activation_type, gated = normalize_cute_dsl_moe_activation_type(activation_type)
         validate_cute_dsl_moe_situ_config(activation_type, situ_beta, situ_linear_beta)
+        validate_cute_dsl_moe_relu2_softclamp(activation_type, relu2_softclamp)
         quant_mode = quant_mode.lower()
-        if quant_mode not in ("w4a4", "w4a8"):
+        if quant_mode not in ("w4a4", "w4a8", "mxfp8"):
             raise ValueError(f"unsupported CuTe-DSL quant_mode {quant_mode!r}")
-        if quant_mode == "w4a8" and use_per_token_activation:
-            raise ValueError("per-token activation scaling is not supported for W4A8")
+        if quant_mode in ("w4a8", "mxfp8") and use_per_token_activation:
+            raise ValueError(
+                f"per-token activation scaling is not supported for {quant_mode}"
+            )
         if localized_weights is not None and quant_mode != "w4a4":
             raise ValueError("localized runner supports quant_mode='w4a4' only")
         self.forward_impl = forward_impl
@@ -540,6 +545,7 @@ class CuteDslFusedMoERunner(TunableRunner):
         self.swiglu_limit = swiglu_limit
         self.situ_beta = situ_beta
         self.situ_linear_beta = situ_linear_beta
+        self.relu2_softclamp = relu2_softclamp
         self.use_per_token_activation = use_per_token_activation
         self.quant_mode = quant_mode
         self.use_cuda_graph = use_cuda_graph
@@ -704,6 +710,7 @@ class CuteDslFusedMoERunner(TunableRunner):
                 self.swiglu_limit,
                 self.situ_beta,
                 self.situ_linear_beta,
+                self.relu2_softclamp,
                 self.use_per_token_activation,
                 self.quant_mode,
                 self.use_cuda_graph,
@@ -720,6 +727,7 @@ class CuteDslFusedMoERunner(TunableRunner):
             self.swiglu_limit,
             self.situ_beta,
             self.situ_linear_beta,
+            self.relu2_softclamp,
             self.num_experts,
             self.local_expert_offset,
             self.use_fused_finalize,
@@ -758,7 +766,8 @@ class CuteDslFusedMoERunner(TunableRunner):
 
         gated = self.gated
         num_tokens = x.shape[0]
-        is_mxfp8 = self.quant_mode == "w4a8"
+        # MXFP8 activations (E4M3 + E8M0, block 32) in both the W4A8 and MXFP8 modes.
+        is_mxfp8 = self.quant_mode in ("w4a8", "mxfp8")
         hidden_size = x.shape[1] * (1 if is_mxfp8 else 2)
         num_local_experts = w1_weight.shape[0]
         # Gated SwiGLU fuses gate+up (2*intermediate rows); non-gated ReLU^2
@@ -769,7 +778,9 @@ class CuteDslFusedMoERunner(TunableRunner):
         gemm2_k = w2_weight.shape[2] * 2
 
         a_dtype = cutlass.Float8E4M3FN if is_mxfp8 else cutlass.Float4E2M1FN
-        b_dtype = cutlass.Float4E2M1FN
+        b_dtype = (
+            cutlass.Float8E4M3FN if self.quant_mode == "mxfp8" else cutlass.Float4E2M1FN
+        )
         sf_dtype = cutlass.Float8E8M0FNU if is_mxfp8 else cutlass.Float8E4M3FN
         sf_vec_size = 32 if is_mxfp8 else 16
 
@@ -963,10 +974,10 @@ class CuteDslFusedMoERunner(TunableRunner):
         if tactic is None or tactic == -1:
             tactic = (
                 DEFAULT_BLACKWELL_MOE_TACTIC
-                if self.quant_mode == "w4a8"
+                if self.quant_mode in ("w4a8", "mxfp8")
                 else _get_default_tactic()
             )
-        elif self.quant_mode == "w4a8":
+        elif self.quant_mode in ("w4a8", "mxfp8"):
             tactic = canonicalize_w4a8_tactic(tactic)
 
         params = _extract_tactic_params(tactic)
@@ -1041,6 +1052,7 @@ class CuteDslFusedMoERunner(TunableRunner):
             swiglu_limit=self.swiglu_limit,
             situ_beta=self.situ_beta,
             situ_linear_beta=self.situ_linear_beta,
+            relu2_softclamp=self.relu2_softclamp,
             **kwargs,
         )
 

@@ -90,6 +90,7 @@ from .moe_utils import (
     moe_output_memset_inplace,
     moe_sort,
     normalize_cute_dsl_moe_activation_type,
+    validate_cute_dsl_moe_relu2_softclamp,
     validate_cute_dsl_moe_situ_config,
 )
 from .blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
@@ -278,8 +279,12 @@ def validate_w4a8_inputs(
     w1_weight_sf: torch.Tensor,
     w2_weight: torch.Tensor,
     w2_weight_sf: torch.Tensor,
+    weight_elems_per_byte: int = 2,
 ) -> None:
-    """Validate mixed-format contracts not checked by the GEMM entry points."""
+    """Validate mixed-format contracts not checked by the GEMM entry points.
+
+    ``weight_elems_per_byte`` is 2 for packed FP4 weights and 1 for 8-bit weights.
+    """
     expected_x_sf = (x.shape[0], x.shape[1] // 32)
     if tuple(x_sf.shape) != expected_x_sf:
         raise ValueError(f"x_sf must have shape {expected_x_sf}")
@@ -295,7 +300,7 @@ def validate_w4a8_inputs(
     ):
         if scale.dtype is not torch.uint8:
             raise TypeError(f"W4A8 {name} must have dtype torch.uint8")
-        rows, columns = weight.shape[1], weight.shape[2] * 2
+        rows, columns = weight.shape[1], weight.shape[2] * weight_elems_per_byte
         m_tiles, k_tiles = (rows + 127) // 128, (columns + 127) // 128
         shape = (32, 4, m_tiles, 4, k_tiles, weight.shape[0])
         strides = (16, 4, k_tiles * 512, 1, 512, m_tiles * k_tiles * 512)
@@ -368,8 +373,15 @@ def _moe_core_impl(
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
     nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
+    weight_dtype: Optional[str] = None,
+    relu2_softclamp: Optional[float] = None,
 ) -> torch.Tensor:
     """Core MoE implementation shared by functional and wrapper APIs.
+
+    ``weight_dtype`` is the element type of ``w1_weight``/``w2_weight``:
+    ``"float4_e2m1fn"`` (packed FP4, the W4A4/W4A8 modes) or ``"float8_e4m3fn"``
+    (the ``mxfp8`` mode; only valid with MXFP8 activations). When ``None`` it is
+    inferred from ``w1_weight.dtype`` (``float8_e4m3fn`` selects FP8 weights).
 
     This function handles:
     1. moe_sort: Token routing computation
@@ -446,6 +458,17 @@ def _moe_core_impl(
     """
     activation, gated = normalize_cute_dsl_moe_activation_type(activation_type)
     is_mxfp8 = x.dtype == torch.float8_e4m3fn
+    if weight_dtype is None:
+        weight_dtype = (
+            "float8_e4m3fn"
+            if w1_weight.dtype == torch.float8_e4m3fn
+            else "float4_e2m1fn"
+        )
+    if weight_dtype not in ("float4_e2m1fn", "float8_e4m3fn"):
+        raise ValueError(f"Unsupported weight_dtype {weight_dtype!r}")
+    if weight_dtype == "float8_e4m3fn" and not is_mxfp8:
+        raise ValueError("MXFP8 weights require MXFP8 (float8_e4m3fn) activations")
+    weight_elems_per_byte = 2 if weight_dtype == "float4_e2m1fn" else 1
     if not is_mxfp8 and x.dtype != torch.uint8:
         raise TypeError(
             "CuTe-DSL block-scaled MoE requires packed NVFP4 (torch.uint8) "
@@ -466,6 +489,7 @@ def _moe_core_impl(
     if is_mxfp8 and (situ_beta is not None or situ_linear_beta is not None):
         raise ValueError("SiTU is not supported when quant_mode='w4a8'")
     validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
+    validate_cute_dsl_moe_relu2_softclamp(activation, relu2_softclamp)
     if is_mxfp8:
         validate_w4a8_inputs(
             x,
@@ -475,6 +499,7 @@ def _moe_core_impl(
             w1_weight_sf,
             w2_weight,
             w2_weight_sf,
+            weight_elems_per_byte=weight_elems_per_byte,
         )
 
     num_tokens = token_selected_experts.size(0)
@@ -740,7 +765,7 @@ def _moe_core_impl(
                 a_per_token_scale=per_token_scale,
                 c_dtype=c_dtype,
                 a_dtype=a_dtype,
-                b_dtype="float4_e2m1fn",
+                b_dtype=weight_dtype,
                 sf_dtype=sf_dtype,
                 sf_vec_size=sf_vec_size,
                 quantize_output=not use_per_token_activation,
@@ -756,6 +781,7 @@ def _moe_core_impl(
                 swiglu_limit=swiglu_limit,
                 situ_beta=situ_beta,
                 situ_linear_beta=situ_linear_beta,
+                relu2_softclamp=relu2_softclamp,
                 gated=gated,
             )
         )
@@ -857,7 +883,7 @@ def _moe_core_impl(
             out=gemm2_output,
             a_per_token_scale=intermediate_per_token_scale,
             a_dtype=a_dtype,
-            b_dtype="float4_e2m1fn",
+            b_dtype=weight_dtype,
             sf_dtype=sf_dtype,
             sf_vec_size=sf_vec_size,
             out_dtype=_intermediate_c_dtype(output_dtype),
@@ -964,6 +990,7 @@ class CuteDslMoEWrapper:
         situ_linear_beta: Optional[float] = None,
         use_fused_finalize: bool = True,
         quant_mode: str = "w4a4",
+        relu2_softclamp: Optional[float] = None,
     ):
         r"""Configure the CuTe-DSL block-scaled fused-MoE wrapper.
 
@@ -1023,6 +1050,7 @@ class CuteDslMoEWrapper:
         activation, gated = normalize_cute_dsl_moe_activation_type(activation_type)
         quant_mode = _canonicalize_quant_mode(quant_mode)
         validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
+        validate_cute_dsl_moe_relu2_softclamp(activation, relu2_softclamp)
         self.num_experts = num_experts
         self.top_k = top_k
         self.hidden_size = hidden_size
@@ -1042,6 +1070,7 @@ class CuteDslMoEWrapper:
         self.swiglu_limit = swiglu_limit
         self.situ_beta = situ_beta
         self.situ_linear_beta = situ_linear_beta
+        self.relu2_softclamp = relu2_softclamp
         self.use_fused_finalize = use_fused_finalize
         self.quant_mode = quant_mode
         if quant_mode == "w4a8":
@@ -1099,6 +1128,7 @@ class CuteDslMoEWrapper:
                 swiglu_limit=swiglu_limit,
                 situ_beta=situ_beta,
                 situ_linear_beta=situ_linear_beta,
+                relu2_softclamp=relu2_softclamp,
                 use_per_token_activation=False,
                 quant_mode=quant_mode,
             )
@@ -1118,6 +1148,7 @@ class CuteDslMoEWrapper:
                     swiglu_limit=swiglu_limit,
                     situ_beta=situ_beta,
                     situ_linear_beta=situ_linear_beta,
+                    relu2_softclamp=relu2_softclamp,
                     use_per_token_activation=True,
                     quant_mode=quant_mode,
                 )
@@ -1127,6 +1158,10 @@ class CuteDslMoEWrapper:
                 self._main_event = torch.cuda.Event()
                 self._memset_event = torch.cuda.Event()
         elif quant_mode == "w4a16":
+            if relu2_softclamp is not None:
+                raise ValueError(
+                    "relu2_softclamp is not supported when quant_mode='w4a16'"
+                )
             self._w4a16_runner = CuteDslFusedMoEW4A16Runner(
                 num_experts=num_experts,
                 top_k=top_k,
@@ -1225,6 +1260,7 @@ class CuteDslMoEWrapper:
             swiglu_limit=self.swiglu_limit,
             situ_beta=self.situ_beta,
             situ_linear_beta=self.situ_linear_beta,
+            relu2_softclamp=self.relu2_softclamp,
         )
 
     @flashinfer_api(trace=cute_dsl_moe_wrapper_run_trace)
@@ -1451,6 +1487,7 @@ def _cute_dsl_fused_moe_impl(
     localized_weights: Optional[list] = None,
     localized_streams: Optional[list] = None,
     sm_count: Optional[int] = None,
+    relu2_softclamp: Optional[float] = None,
 ) -> torch.Tensor:
     """Internal implementation called by auto-tuner for functional API."""
     return _moe_core_impl(
@@ -1496,6 +1533,7 @@ def _cute_dsl_fused_moe_impl(
         localized_weights=localized_weights,
         localized_streams=localized_streams,
         sm_count=sm_count,
+        relu2_softclamp=relu2_softclamp,
     )
 
 
@@ -1530,6 +1568,7 @@ def cute_dsl_fused_moe(
     situ_linear_beta: Optional[float] = None,
     *,
     quant_mode: str = "w4a4",
+    relu2_softclamp: Optional[float] = None,
     per_token_scale: Optional[torch.Tensor] = None,
     tactic: Optional[Tuple] = None,
     # locality-domain localization (Rubin NVFP4 only). One weight-shard dict and one
@@ -1609,13 +1648,20 @@ def cute_dsl_fused_moe(
     swiglu_alpha, swiglu_beta, swiglu_limit : float
         SwiGLU parameters.
     quant_mode : str
-        Compute mode: ``"w4a4"``, ``"w4a8"``, or ``"w4a16"``. Defaults to
-        ``"w4a4"``. ``"nvfp4"`` is a deprecated alias for ``"w4a4"``.
+        Compute mode: ``"w4a4"``, ``"w4a8"``, ``"w4a16"``, or ``"mxfp8"``.
+        Defaults to ``"w4a4"``. ``"nvfp4"`` is a deprecated alias for
+        ``"w4a4"``. ``"mxfp8"`` runs MXFP8 weights (``float8_e4m3fn`` with E8M0
+        block-32 scales in the MMA layout) against MXFP8 activations
+        (``x`` is ``float8_e4m3fn`` and ``x_sf`` the row-major E8M0 scales as
+        ``uint8``), with ``fc2_input_scale=None`` and BF16 output.
     situ_beta : Optional[float]
         When set with ``ActivationType.Swiglu``, use the SiTU gate
         ``beta * tanh(gate / beta) * sigmoid(gate)``.
     situ_linear_beta : Optional[float]
         Optional SiTU tanh clamp for the up branch.
+    relu2_softclamp : Optional[float]
+        When set with ``ActivationType.Relu2``, the FC1 output is smooth-clamped
+        as ``c * tanh(x / c)`` before the ReLU^2. Not supported by ``"w4a16"``.
     per_token_scale : Optional[torch.Tensor]
         Optional W4A4 per-token input row scale for GEMM1.
     tactic : Optional[Tuple]
@@ -1693,12 +1739,20 @@ def cute_dsl_fused_moe(
     activation, _ = normalize_cute_dsl_moe_activation_type(activation_type)
     quant_mode = _canonicalize_quant_mode(quant_mode)
     validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
+    validate_cute_dsl_moe_relu2_softclamp(activation, relu2_softclamp)
 
     if quant_mode == "w4a8":
         if x.dtype is not torch.float8_e4m3fn:
             raise TypeError("quant_mode='w4a8' requires float8_e4m3fn input")
         if torch.cuda.get_device_capability(x.device) == (10, 7):
             raise ValueError("quant_mode='w4a8' is not supported on SM107")
+    elif quant_mode == "mxfp8":
+        if x.dtype is not torch.float8_e4m3fn:
+            raise TypeError("quant_mode='mxfp8' requires float8_e4m3fn input")
+        if w1_weight.dtype is not torch.float8_e4m3fn:
+            raise TypeError("quant_mode='mxfp8' requires float8_e4m3fn weights")
+        if torch.cuda.get_device_capability(x.device) == (10, 7):
+            raise ValueError("quant_mode='mxfp8' is not supported on SM107")
     elif quant_mode == "w4a4" and x.dtype is not torch.uint8:
         raise TypeError("quant_mode='w4a4' requires packed uint8 input")
 
@@ -1724,7 +1778,7 @@ def cute_dsl_fused_moe(
             f"only, got quant_mode={quant_mode!r}."
         )
 
-    if quant_mode in ("w4a4", "w4a8"):
+    if quant_mode in ("w4a4", "w4a8", "mxfp8"):
         use_per_token_activation = per_token_scale is not None
         if localized_weights is not None and use_per_token_activation:
             raise NotImplementedError(
@@ -1750,6 +1804,7 @@ def cute_dsl_fused_moe(
             swiglu_limit=swiglu_limit,
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
+            relu2_softclamp=relu2_softclamp,
             use_per_token_activation=use_per_token_activation,
             quant_mode=quant_mode,
             use_cuda_graph=autotune_use_cuda_graph,
@@ -1792,7 +1847,7 @@ def cute_dsl_fused_moe(
         inputs.append(moe_output)
 
         activation_name = "Situ" if situ_beta is not None else activation.name
-        format_name = "w4a8" if quant_mode == "w4a8" else "w4a4"
+        format_name = quant_mode
         op_name = f"CuteDslFusedMoE::run_moe_{format_name}::{activation_name}"
         if localized_weights is not None:
             policy = (
@@ -1800,6 +1855,8 @@ def cute_dsl_fused_moe(
             )
             op_name = f"{op_name}::{policy}"
     elif quant_mode == "w4a16":
+        if relu2_softclamp is not None:
+            raise ValueError("relu2_softclamp is not supported when quant_mode='w4a16'")
         if (
             x_sf is not None
             or fc2_input_scale is not None
@@ -1841,7 +1898,8 @@ def cute_dsl_fused_moe(
         op_name = f"CuteDslFusedMoE::run_moe_w4a16::{activation_name}"
     else:
         raise ValueError(
-            f"quant_mode must be 'w4a4', 'w4a8', or 'w4a16' (got {quant_mode!r})."
+            "quant_mode must be 'w4a4', 'w4a8', 'w4a16', or 'mxfp8' "
+            f"(got {quant_mode!r})."
         )
 
     if tactic is not None:

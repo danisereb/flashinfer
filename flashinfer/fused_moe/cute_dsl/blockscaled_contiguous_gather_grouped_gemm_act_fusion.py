@@ -71,6 +71,7 @@ from flashinfer.cute_dsl.utils import (
 )
 from .moe_utils import (
     normalize_cute_dsl_moe_activation_type,
+    validate_cute_dsl_moe_relu2_softclamp,
     validate_cute_dsl_moe_situ_config,
 )
 
@@ -273,6 +274,7 @@ def _get_compiled_gather_kernel(
     use_a_per_token_scale: bool = False,
     # locality-domain half-GEMM (Rubin only, compile-time - IN cache key)
     localized_half_gemm: bool = False,
+    relu2_softclamp: Optional[float] = None,
 ):
     """Get or compile the gather grouped GEMM with FC1 activation fusion.
 
@@ -294,6 +296,7 @@ def _get_compiled_gather_kernel(
     validate_cute_dsl_moe_situ_config(
         normalized_activation_type, situ_beta, situ_linear_beta
     )
+    validate_cute_dsl_moe_relu2_softclamp(normalized_activation_type, relu2_softclamp)
 
     is_rubin = mma_tiler is not None and mma_inst_shape is not None
 
@@ -323,12 +326,18 @@ def _get_compiled_gather_kernel(
         swiglu_limit,
         situ_beta,
         situ_linear_beta,
+        relu2_softclamp,
         gated,
         use_a_per_token_scale,
     )
 
     if cache_key not in _gather_kernel_cache:
         if is_rubin:
+            if relu2_softclamp is not None:
+                raise NotImplementedError(
+                    "relu2_softclamp is not supported by the Rubin (SM107) "
+                    "gather grouped GEMM kernel yet."
+                )
             # The Rubin (SM107) kernel implements SwiGLU (plus its SiTU variant,
             # selected by situ_beta) and Relu2. Plain SwiGLU accepts a clamp
             # limit; custom swiglu_alpha/swiglu_beta and GeGLU-tanh are not
@@ -404,6 +413,7 @@ def _get_compiled_gather_kernel(
                 swiglu_limit=swiglu_limit,
                 situ_beta=situ_beta,
                 situ_linear_beta=situ_linear_beta,
+                relu2_softclamp=relu2_softclamp,
                 gated=gated,
                 use_a_per_token_scale=use_a_per_token_scale,
             )
@@ -499,6 +509,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
     gated: bool = True,
+    relu2_softclamp: Optional[float] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Blockscaled contiguous gather grouped GEMM with fused FC1 activation.
 
@@ -973,6 +984,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         swiglu_limit=swiglu_limit,
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
+        relu2_softclamp=relu2_softclamp,
         gated=gated,
         use_a_per_token_scale=use_a_per_token_scale,
         localized_half_gemm=localized_half_gemm,

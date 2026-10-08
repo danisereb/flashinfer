@@ -53,6 +53,7 @@ from flashinfer.quantization.quantization_cute_dsl_utils import (
 
 from ..moe_utils import (
     normalize_cute_dsl_moe_activation_type,
+    validate_cute_dsl_moe_relu2_softclamp,
     validate_cute_dsl_moe_situ_config,
 )
 from .custom_pipeline import PipelineCpAsyncUmma
@@ -429,6 +430,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         situ_linear_beta: Optional[float] = None,
         gated: bool = True,
         use_a_per_token_scale: bool = False,
+        relu2_softclamp: Optional[float] = None,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel with
         gather operation and FC1 activation fusion.
@@ -484,6 +486,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         :type situ_beta: Optional[float]
         :param situ_linear_beta: Optional SiTU tanh clamp for the up branch.
         :type situ_linear_beta: Optional[float]
+        :param relu2_softclamp: When set (ReLU^2 only), the FC1 accumulator is
+            smooth-clamped as ``c * tanh(x / c)`` before the ReLU^2.
+        :type relu2_softclamp: Optional[float]
         :param gated: Whether GEMM1 output is split into up/gate halves. If
             False, the epilogue computes non-gated ReLU^2.
         :type gated: bool
@@ -581,6 +586,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 f"gated={gated} is inconsistent with activation_type {activation_type!r}"
             )
         validate_cute_dsl_moe_situ_config(activation_type, situ_beta, situ_linear_beta)
+        validate_cute_dsl_moe_relu2_softclamp(activation_type, relu2_softclamp)
         self.vectorized_f32 = vectorized_f32
         self.activation_type = int(activation_type)
         self.swiglu_alpha = swiglu_alpha
@@ -588,6 +594,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         self.swiglu_limit = swiglu_limit
         self.situ_beta = situ_beta
         self.situ_linear_beta = situ_linear_beta
+        self.relu2_softclamp = relu2_softclamp
 
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
@@ -2773,6 +2780,11 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                     if cutlass.const_expr(not self.gated):
                         acc_vec = tTR_rAcc_up.load()
                         tCompute = cute.make_rmem_tensor(acc_vec.shape, self.acc_dtype)
+                        if cutlass.const_expr(self.relu2_softclamp is not None):
+                            softclamp = cutlass.Float32(self.relu2_softclamp)
+                            inv_softclamp = cutlass.Float32(
+                                f32_reciprocal(self.relu2_softclamp)
+                            )
                         if cutlass.const_expr(self.vectorized_f32):
                             for i in cutlass.range_constexpr(
                                 0, cute.size(tTR_rAcc_up), 2
@@ -2784,6 +2796,19 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                                         cutlass.Float32(alpha_val),
                                     ),
                                 )
+                                if cutlass.const_expr(self.relu2_softclamp is not None):
+                                    acc_alpha = (
+                                        softclamp
+                                        * tanh_f32(
+                                            acc_alpha[0] * inv_softclamp,
+                                            fastmath=True,
+                                        ),
+                                        softclamp
+                                        * tanh_f32(
+                                            acc_alpha[1] * inv_softclamp,
+                                            fastmath=True,
+                                        ),
+                                    )
                                 r0 = cute.arch.fmax(acc_alpha[0], cutlass.Float32(0.0))
                                 r1 = cute.arch.fmax(acc_alpha[1], cutlass.Float32(0.0))
                                 (
@@ -2793,6 +2818,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         else:
                             for i in cutlass.range_constexpr(cute.size(tTR_rAcc_up)):
                                 v = acc_vec[i] * cutlass.Float32(alpha_val)
+                                if cutlass.const_expr(self.relu2_softclamp is not None):
+                                    v = softclamp * tanh_f32(
+                                        v * inv_softclamp, fastmath=True
+                                    )
                                 v = cute.arch.fmax(v, cutlass.Float32(0.0))
                                 tCompute[i] = v * v
                     else:
