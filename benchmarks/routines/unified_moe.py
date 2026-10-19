@@ -543,6 +543,9 @@ def _choose_tactic(args, runner, inputs: list[torch.Tensor]):
             runners=[runner],
             tuning_config=runner.tuning_config_for(inputs),
             inputs=inputs,
+            # Profiling builds plain input lists; stateful runners (TRTLLM)
+            # take their launch state from the packed call instead.
+            **runner.launch_kwargs_for(inputs),
         )
     return tactic
 
@@ -557,7 +560,9 @@ def _measure_runner(
     bf16_input=None,
     hidden_index: int = 1,
 ):
-    runner.forward(inputs, tactic=tactic, do_preparation=True)
+    # Rebuilt input lists below drop the packed call's launch state.
+    launch_kwargs = runner.launch_kwargs_for(inputs)
+    runner.forward(inputs, tactic=tactic, do_preparation=True, **launch_kwargs)
     torch.cuda.synchronize()
 
     def run(*profile_inputs):
@@ -571,7 +576,7 @@ def _measure_runner(
             packed[hidden_index] = quantized
             if scale is not None:  # per-tensor FP8 keeps its scale in the view
                 packed[-1] = scale
-        return runner.forward(packed, tactic=tactic)
+        return runner.forward(packed, tactic=tactic, **launch_kwargs)
 
     profile_inputs = tuple(inputs) if input_quantizer is None else (bf16_input, *inputs)
     output = run(*profile_inputs).detach().clone()
@@ -701,7 +706,12 @@ def run_unified_moe_test(args):
                 )
             # Like mm_fp4, execute the fallback once to reject configurations
             # that pass the coarse architecture check but fail at runtime.
-            runner.forward(inputs, tactic=-1, do_preparation=True)
+            runner.forward(
+                inputs,
+                tactic=-1,
+                do_preparation=True,
+                **runner.launch_kwargs_for(inputs),
+            )
             torch.cuda.synchronize()
         except (NotImplementedError, RuntimeError, TypeError, ValueError) as error:
             print(
