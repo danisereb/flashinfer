@@ -775,7 +775,8 @@ class CuteDslFusedMoERunner(TunableRunner):
         gemm1_n = w1_weight.shape[1]
         intermediate_size = gemm1_n // 2 if gated else gemm1_n
         gemm2_n = w2_weight.shape[1]
-        gemm2_k = w2_weight.shape[2] * 2
+        # Packed FP4 weights hold two elements per byte; MXFP8 weights one.
+        gemm2_k = w2_weight.shape[2] * (1 if self.quant_mode == "mxfp8" else 2)
 
         a_dtype = cutlass.Float8E4M3FN if is_mxfp8 else cutlass.Float4E2M1FN
         b_dtype = (
