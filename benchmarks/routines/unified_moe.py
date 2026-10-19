@@ -1,4 +1,4 @@
-"""Apples-to-apples benchmarks for unified CUTLASS, cuTile, b12x, SM12x and cuDNN grouped-GEMM MoE runners."""
+"""Apples-to-apples benchmarks for unified CUTLASS, cuTile, b12x, SM12x, cuDNN grouped-GEMM, TRTLLM and CuTe-DSL MoE runners."""
 
 from __future__ import annotations
 
@@ -29,6 +29,7 @@ from flashinfer.fused_moe import (
     CutlassMxfp8Mxfp4Config,
     CutlassNvfp4Config,
     CutlassW4A16Config,
+    CuteDslConfig,
     CuTileBf16Config,
     CuTileFp8PerTensorBf16Config,
     CuTileFp8PerTensorConfig,
@@ -61,6 +62,7 @@ from flashinfer.fused_moe import (
     SiTU,
     SwiGLU,
     SwiGLUStep,
+    TrtllmFp8BlockConfig,
 )
 from flashinfer.fused_moe.prepare import (
     _quantize_mxfp4_linear,
@@ -104,6 +106,8 @@ _BACKEND_CONFIGS = {
     ("mxfp8", "cutile"): CuTileMxfp8Config,
     ("mxfp8", "cutlass"): CutlassMxfp8Config,
     ("mxfp8", "cudnn"): CudnnGroupedGemmMxfp8Config,
+    ("mxfp8", "trtllm"): TrtllmFp8BlockConfig,
+    ("mxfp8", "cute_dsl"): CuteDslConfig,
     ("mxfp8_w8a16", "cutile"): CuTileMxfp8Bf16Config,
     ("mxfp4_w4a8", "cutile"): CuTileMxfp4Mxfp8Config,
     ("mxfp4_w4a8", "cutlass"): CutlassMxfp8Mxfp4Config,
@@ -118,7 +122,11 @@ _PREQUANTIZED_ACTIVATIONS = (
     CutlassMxfp8Config,
     CudnnGroupedGemmMxfp8Config,
     CudnnGroupedGemmNvfp4Config,
+    TrtllmFp8BlockConfig,
+    CuteDslConfig,
 )
+# Backends whose weight and activation preparers take the layer's ``quant``.
+_QUANT_AWARE_PREPARERS = (TrtllmFp8BlockConfig, CuteDslConfig)
 # Backends taking pre-quantized activations whose BF16 conversion is timed, to
 # match the API boundary of the backends that quantize in-kernel.
 _TIMED_INPUT_QUANTIZATION = (
@@ -165,7 +173,7 @@ def parse_unified_moe_args(line, parser: argparse.ArgumentParser):
     parser.add_argument(
         "--backends",
         nargs="+",
-        choices=("cutlass", "cutile", "b12x", "sm12x", "cudnn"),
+        choices=("cutlass", "cutile", "b12x", "sm12x", "cudnn", "trtllm", "cute_dsl"),
         default=["cutlass", "cutile"],
         help="Unified MoE backends to benchmark with the same inputs.",
     )
@@ -351,6 +359,8 @@ def _prepare_weight_view(
         common.update(fp8_static_scales)
     if quant_variant == "bf16" or backend in ("cutlass", "cudnn"):
         return config_type.prepare_weights(w1, w2, **common)
+    if config_type in _QUANT_AWARE_PREPARERS:
+        return config_type.prepare_weights(w1, w2, quant=_quant_config(args), **common)
 
     if quant_variant.startswith(("fp8", "mxfp8")):
         block_scaled = quant_variant.startswith("mxfp8")
@@ -493,7 +503,7 @@ def _reference_activation(
     return result.to(torch.bfloat16)
 
 
-def _config_for_backend(args, activation, backend_config) -> MoEConfig:
+def _quant_config(args) -> QuantConfig:
     weight_format, activation_format = {
         "bf16": (QuantFormat.BF16, QuantFormat.BF16),
         "nvfp4": (QuantFormat.NVFP4, QuantFormat.NVFP4),
@@ -506,9 +516,13 @@ def _config_for_backend(args, activation, backend_config) -> MoEConfig:
         "mxfp8_w8a16": (QuantFormat.MXFP8, QuantFormat.BF16),
         "mxfp4_w4a8": (QuantFormat.MXFP4, QuantFormat.MXFP8),
     }[args.quant_variant]
+    return QuantConfig(weight=weight_format, activation=activation_format)
+
+
+def _config_for_backend(args, activation, backend_config) -> MoEConfig:
     return MoEConfig(
         routing=RoutingConfig(num_experts=args.num_experts, top_k=args.top_k),
-        quant=QuantConfig(weight=weight_format, activation=activation_format),
+        quant=_quant_config(args),
         experts=ExpertConfig(intermediate_size=args.intermediate_size),
         activation=activation,
         backend=BackendOptions((backend_config,)),
@@ -636,6 +650,10 @@ def run_unified_moe_test(args):
                     hidden_states_scale_global=fp8_static_scales[
                         "hidden_states_scale_global"
                     ],
+                )
+            if config_type in _QUANT_AWARE_PREPARERS:
+                prepare_activations = functools.partial(
+                    prepare_activations, quant=config.quant
                 )
             if config_type in _PREQUANTIZED_ACTIVATIONS:
                 # Inside the guard so an unaligned hidden_size skips this
