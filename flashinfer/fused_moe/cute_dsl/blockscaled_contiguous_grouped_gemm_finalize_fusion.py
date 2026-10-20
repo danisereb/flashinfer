@@ -310,6 +310,8 @@ def _get_compiled_finalize_kernel(
                 enable_pdl=enable_pdl,
                 use_a_per_token_scale=use_a_per_token_scale,
                 use_fused_finalize=use_fused_finalize,
+                # MXFP8 only (b_dtype is in the cache key): leaves W4A4/W4A8 unchanged.
+                early_pdl_trigger=b_dtype is cutlass.Float8E4M3FN,
             )
             wrapper_fn = gemm_bw.wrapper
 

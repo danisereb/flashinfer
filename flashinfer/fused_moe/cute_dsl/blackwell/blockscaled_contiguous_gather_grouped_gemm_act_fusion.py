@@ -429,6 +429,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         situ_linear_beta: Optional[float] = None,
         gated: bool = True,
         use_a_per_token_scale: bool = False,
+        early_pdl_trigger: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel with
         gather operation and FC1 activation fusion.
@@ -487,10 +488,16 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         :param gated: Whether GEMM1 output is split into up/gate halves. If
             False, the epilogue computes non-gated ReLU^2.
         :type gated: bool
+        :param early_pdl_trigger: With enable_pdl, let dependent grids launch once
+            the MMA warp has issued its last tile instead of at kernel exit, so
+            their prologue overlaps this kernel's final epilogue. Their
+            griddepcontrol.wait still waits for this grid to complete.
+        :type early_pdl_trigger: bool
         """
 
         self.sf_vec_size = sf_vec_size
         self.enable_pdl = enable_pdl
+        self.early_pdl_trigger = early_pdl_trigger
         self.use_a_per_token_scale = use_a_per_token_scale
         self.topk = topk
         self.gated = gated
@@ -2522,6 +2529,11 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 )
                 tile_info_pipeline.consumer_release(tile_info_consumer_state)
                 tile_info_consumer_state.advance()
+            # All MMAs are issued: let the dependent grid launch while the epilogue
+            # drains (early_pdl_trigger). The exit trigger below stays as is.
+            if cutlass.const_expr(self.enable_pdl and self.early_pdl_trigger):
+                with cute.arch.elect_one():
+                    griddepcontrol_launch_dependents()
             #
             # Wait for accumulator buffer empty
             #

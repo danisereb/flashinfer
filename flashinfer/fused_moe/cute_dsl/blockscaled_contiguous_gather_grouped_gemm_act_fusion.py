@@ -406,6 +406,8 @@ def _get_compiled_gather_kernel(
                 situ_linear_beta=situ_linear_beta,
                 gated=gated,
                 use_a_per_token_scale=use_a_per_token_scale,
+                # MXFP8 only (b_dtype is in the cache key): leaves W4A4/W4A8 unchanged.
+                early_pdl_trigger=b_dtype == "float8_e4m3fn",
             )
         wrapper_fn = gemm.wrapper
 
