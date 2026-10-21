@@ -318,6 +318,16 @@ ALL_BLACKWELL_MOE_TACTICS = get_blackwell_moe_valid_tactics()
 ALL_W4A8_MOE_TACTICS = get_w4a8_moe_valid_tactics()
 ALL_RUBIN_MOE_TACTICS = get_rubin_moe_valid_tactics()
 
+# MXFP8 decode tactic (tile 128, GEMM1 N=128, GEMM2 N=64, no clusters) and the
+# expected GEMM2 tile count (routed rows per rank x hidden / 64) up to which
+# ``get_valid_tactics`` pins it instead of profiling.
+_MXFP8_SMALL_BATCH_TACTIC = (
+    128,
+    ((128, 128), (1, 1), False),
+    ((128, 64), (1, 1), False),
+)
+_MXFP8_SMALL_BATCH_MAX_GEMM2_TILES = 1024
+
 # Backwards-compatible alias.  Before the tactic space became
 # architecture-dependent, the Blackwell list was simply ALL_MOE_TACTICS.
 # Use _get_arch_tactics() for new code.
@@ -927,6 +937,17 @@ class CuteDslFusedMoERunner(TunableRunner):
             return gemm1_ok and gemm2_ok
 
         valid_tactics = [t for t in all_tactics if _tactic_ok(t)]
+
+        # MXFP8 at decode sizes: profiling picks GEMM2 N=192 for few routed rows,
+        # 7-15% slower than N=64 in cold-L2 CUDA-graph replay, and N=64 was never
+        # more than 0.2% behind the profiled pick up to ~1024 GEMM2 tiles (GB200,
+        # hidden 1024, EP 1-8). Pin the small-batch tactic in that range.
+        if self.quant_mode == "mxfp8" and _MXFP8_SMALL_BATCH_TACTIC in valid_tactics:
+            ep_size = max(self.num_experts // self.num_local_experts, 1)
+            expected_rows = num_tokens * self.top_k / ep_size
+            gemm2_tiles = expected_rows * -(-hidden_size // 64)
+            if gemm2_tiles <= _MXFP8_SMALL_BATCH_MAX_GEMM2_TILES:
+                valid_tactics = [_MXFP8_SMALL_BATCH_TACTIC]
 
         if not valid_tactics:
             # The default tactic is a member of the arch tactic list, so an empty
