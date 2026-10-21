@@ -71,6 +71,7 @@ from flashinfer.cute_dsl.utils import (
 )
 from .moe_utils import (
     normalize_cute_dsl_moe_activation_type,
+    validate_cute_dsl_moe_clamped_relu2,
     validate_cute_dsl_moe_situ_config,
 )
 
@@ -271,6 +272,9 @@ def _get_compiled_gather_kernel(
     situ_linear_beta: Optional[float] = None,
     gated: bool = True,
     use_a_per_token_scale: bool = False,
+    # ClampedRelu2 limit pointer (runtime parameter - NOT in cache key; the
+    # activation type above selects the clamped epilogue)
+    clamped_relu2_limit_ptr=None,
     # locality-domain half-GEMM (Rubin only, compile-time - IN cache key)
     localized_half_gemm: bool = False,
 ):
@@ -284,7 +288,7 @@ def _get_compiled_gather_kernel(
     """
     global _gather_kernel_cache
     normalized_activation_type, expected_gated = normalize_cute_dsl_moe_activation_type(
-        activation_type
+        activation_type, allow_clamped_relu2=True
     )
     if gated != expected_gated:
         raise ValueError(
@@ -294,6 +298,13 @@ def _get_compiled_gather_kernel(
     validate_cute_dsl_moe_situ_config(
         normalized_activation_type, situ_beta, situ_linear_beta
     )
+    if (normalized_activation_type == ActivationType.ClampedRelu2) != (
+        clamped_relu2_limit_ptr is not None
+    ):
+        raise ValueError(
+            "clamped_relu2_limit is required with ActivationType.ClampedRelu2 "
+            "and must be None otherwise"
+        )
 
     is_rubin = mma_tiler is not None and mma_inst_shape is not None
 
@@ -332,7 +343,7 @@ def _get_compiled_gather_kernel(
             # The Rubin (SM107) kernel implements SwiGLU (plus its SiTU variant,
             # selected by situ_beta) and Relu2. Plain SwiGLU accepts a clamp
             # limit; custom swiglu_alpha/swiglu_beta and GeGLU-tanh are not
-            # implemented.
+            # implemented, nor is ClampedRelu2.
             if normalized_activation_type not in (
                 ActivationType.Swiglu,
                 ActivationType.Relu2,
@@ -412,13 +423,14 @@ def _get_compiled_gather_kernel(
         # Compile with runtime parameters - they can vary across calls.
         # Order must match the wrapper signature, and the two wrappers have
         # DIFFERENT arities: the Blackwell wrapper takes a_per_token_scale_ptr
-        # (13 pointers), the Rubin SM107 wrapper does not (12 pointers).
+        # and clamped_relu2_limit_ptr (14 pointers), the Rubin SM107 wrapper
+        # takes neither (12 pointers).
         # Passing 13 pointers to the SM107 wrapper shifts every argument one
         # slot and dies with "multiple values for argument 'tile_size'".
         # (a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, c_sf_ptr, alpha_ptr,
         #  tile_idx_to_group_idx_ptr, tile_idx_to_mn_limit_ptr, token_id_mapping_ptr,
-        #  num_non_exiting_tiles_ptr, global_sf_ptr, [a_per_token_scale_ptr],
-        #  orig_m, m, n, k, l, tile_size, scaling_vector_size,
+        #  num_non_exiting_tiles_ptr, global_sf_ptr, [a_per_token_scale_ptr,
+        #  clamped_relu2_limit_ptr], orig_m, m, n, k, l, tile_size, scaling_vector_size,
         #  max_active_clusters, stream)
         compiled_gemm = cute.compile(
             wrapper_fn,
@@ -434,7 +446,7 @@ def _get_compiled_gather_kernel(
             token_id_ptr,
             num_tiles_ptr,
             norm_const_ptr,
-            *([] if is_rubin else [a_per_token_scale_ptr]),
+            *([] if is_rubin else [a_per_token_scale_ptr, clamped_relu2_limit_ptr]),
             orig_m,
             permuted_m,
             n,
@@ -499,6 +511,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
     gated: bool = True,
+    clamped_relu2_limit: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Blockscaled contiguous gather grouped GEMM with fused FC1 activation.
 
@@ -560,7 +573,8 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         activation_type: Activation type for the epilogue. Use
             ActivationType.Swiglu for gated SwiGLU/OAI/SiTU,
             ActivationType.GegluTanh for tanh-approximate GeGLU, and
-            ActivationType.Relu2 for non-gated mode. Setting situ_beta selects
+            ActivationType.Relu2 or ActivationType.ClampedRelu2 for non-gated
+            mode. Setting situ_beta selects
             SiTU; swiglu_oai is represented as Swiglu with non-default
             swiglu_alpha/beta/limit.
         swiglu_alpha: SwiGLU sigmoid multiplier.
@@ -570,7 +584,13 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
             ``beta * tanh(gate / beta) * sigmoid(gate)``.
         situ_linear_beta: Optional SiTU tanh clamp for the up branch.
         gated: Whether to run the gated SwiGLU path. If False, run non-gated
-            ReLU2.
+            ReLU2 (or clamped ReLU2).
+        clamped_relu2_limit: Model-wide positive clamp scale ``L`` for
+            ActivationType.ClampedRelu2, a one-element float32 CUDA tensor of
+            shape (1,) read by the kernel at runtime. ClampedRelu2 computes
+            ``relu(L * tanh(x / L)) ** 2`` on the alpha-scaled FC1 output
+            ``x``. Required with ClampedRelu2 and rejected for every other
+            activation. Not supported on SM107.
 
     Returns:
         Tuple of:
@@ -619,7 +639,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
     assert a.device.type == "cuda", "Input tensors must be on CUDA device"
     assert b.device.type == "cuda", "Input tensors must be on CUDA device"
     normalized_activation_type, expected_gated = normalize_cute_dsl_moe_activation_type(
-        activation_type
+        activation_type, allow_clamped_relu2=True
     )
     if gated != expected_gated:
         raise ValueError(
@@ -628,6 +648,16 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         )
     validate_cute_dsl_moe_situ_config(
         normalized_activation_type, situ_beta, situ_linear_beta
+    )
+    validate_cute_dsl_moe_clamped_relu2(
+        normalized_activation_type,
+        clamped_relu2_limit,
+        a.device,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        swiglu_limit=swiglu_limit,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
     )
 
     # Get dimensions
@@ -913,6 +943,13 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         )
     else:
         a_per_token_scale_ptr = None
+    clamped_relu2_limit_ptr = (
+        make_ptr(
+            cutlass.Float32, clamped_relu2_limit.data_ptr(), cute.AddressSpace.gmem
+        )
+        if clamped_relu2_limit is not None
+        else None
+    )
     tile_idx_ptr = make_ptr(
         cutlass.Int32, tile_idx_to_expert_idx.data_ptr(), cute.AddressSpace.gmem
     )
@@ -976,6 +1013,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         situ_linear_beta=situ_linear_beta,
         gated=gated,
         use_a_per_token_scale=use_a_per_token_scale,
+        clamped_relu2_limit_ptr=clamped_relu2_limit_ptr,
         localized_half_gemm=localized_half_gemm,
     )
 
@@ -986,7 +1024,8 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
     # shifts one slot ("multiple values for argument 'stream'").
     # (a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, c_sf_ptr, alpha_ptr,
     #  tile_idx_ptr, mn_limit_ptr, token_id_ptr, num_tiles_ptr, global_sf_ptr,
-    #  [a_per_token_scale_ptr], orig_m, m, n, k, l, stream)
+    #  [a_per_token_scale_ptr, clamped_relu2_limit_ptr], orig_m, m, n, k, l,
+    #  stream)
     compiled_gemm(
         a_ptr,
         b_ptr,
@@ -1000,7 +1039,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         token_id_ptr,
         num_tiles_ptr,
         norm_const_ptr,
-        *([] if is_rubin else [a_per_token_scale_ptr]),
+        *([] if is_rubin else [a_per_token_scale_ptr, clamped_relu2_limit_ptr]),
         seq_len,  # orig_m
         permuted_m,
         n,
@@ -1058,6 +1097,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
     gated: bool = True,
+    clamped_relu2_limit: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Run the existing NVFP4 gather GEMM1 path.
 
@@ -1108,6 +1148,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
         gated=gated,
+        clamped_relu2_limit=clamped_relu2_limit,
     )
 
 

@@ -48,6 +48,7 @@ _requires_dsl_arch = pytest.mark.skipif(
 from flashinfer.tllm_enums import ActivationType
 from flashinfer.fused_moe.cute_dsl.moe_utils import (
     normalize_cute_dsl_moe_activation_type,
+    validate_cute_dsl_moe_clamped_relu2,
     validate_cute_dsl_moe_situ_config,
 )
 from flashinfer.cute_dsl import is_cute_dsl_available
@@ -261,6 +262,146 @@ def test_w4a4_and_w4a8_use_distinct_tuner_cache_keys():
 def test_invalid_situ_config(activation_type, situ_beta, situ_linear_beta, error: str):
     with pytest.raises(ValueError, match=error):
         validate_cute_dsl_moe_situ_config(activation_type, situ_beta, situ_linear_beta)
+
+
+def test_clamped_relu2_is_non_gated_and_blockscaled_only():
+    activation_type, gated = normalize_cute_dsl_moe_activation_type(
+        ActivationType.ClampedRelu2, allow_clamped_relu2=True
+    )
+    assert activation_type == ActivationType.ClampedRelu2
+    assert not gated
+    # Paths without a ClampedRelu2 epilogue (SM90, W4A16) do not opt in.
+    with pytest.raises(ValueError, match="Unsupported activation_type"):
+        normalize_cute_dsl_moe_activation_type(ActivationType.ClampedRelu2)
+
+
+def _cpu_limit(value=1.0, shape=(1,), dtype=torch.float32):
+    return torch.full(shape, value, dtype=dtype)
+
+
+# Error cases and error text mirror cutlass_fused_moe's ClampedRelu2 checks. All
+# of them fail before the device check, so CPU tensors suffice.
+@pytest.mark.parametrize(
+    "activation_type,make_limit,error",
+    [
+        (
+            ActivationType.ClampedRelu2,
+            lambda: None,
+            "requires a one-element clamped_relu2_limit tensor",
+        ),
+        (ActivationType.ClampedRelu2, lambda: 1.0, "must be a torch.Tensor"),
+        (
+            ActivationType.ClampedRelu2,
+            lambda: _cpu_limit(shape=(2,)),
+            r"with shape \(1,\), got \(2,\)",
+        ),
+        (
+            ActivationType.ClampedRelu2,
+            lambda: _cpu_limit(shape=()),
+            r"with shape \(1,\), got \(\)",
+        ),
+        (
+            ActivationType.ClampedRelu2,
+            lambda: _cpu_limit(shape=(1, 1)),
+            r"with shape \(1,\), got \(1, 1\)",
+        ),
+        (
+            ActivationType.ClampedRelu2,
+            lambda: _cpu_limit(dtype=torch.float16),
+            "Invalid dtype of ClampedRelu2 clamped_relu2_limit",
+        ),
+        (
+            ActivationType.ClampedRelu2,
+            lambda: _cpu_limit(),
+            "Invalid device of ClampedRelu2 clamped_relu2_limit",
+        ),
+        (
+            ActivationType.Relu2,
+            lambda: _cpu_limit(),
+            "supported only with ActivationType.ClampedRelu2",
+        ),
+        (
+            ActivationType.Swiglu,
+            lambda: _cpu_limit(),
+            "supported only with ActivationType.ClampedRelu2",
+        ),
+    ],
+)
+def test_invalid_clamped_relu2_config(activation_type, make_limit, error):
+    exc = TypeError if error == "must be a torch.Tensor" else ValueError
+    with pytest.raises(exc, match=error):
+        validate_cute_dsl_moe_clamped_relu2(activation_type, make_limit())
+    if activation_type == ActivationType.ClampedRelu2 and exc is ValueError:
+        # Also with an explicit expected device, as the functional API passes.
+        with pytest.raises(ValueError, match=error.split(" of ")[0]):
+            validate_cute_dsl_moe_clamped_relu2(
+                activation_type, make_limit(), torch.device("cuda", 0)
+            )
+
+
+def test_clamped_relu2_runner_validation_and_cache_key():
+    from flashinfer.fused_moe.cute_dsl.tuner import (
+        CuteDslFusedMoERunner,
+        CuteDslFusedMoEW4A16Runner,
+    )
+
+    kwargs = dict(
+        forward_impl=lambda *args, **kwargs: None,
+        num_experts=8,
+        top_k=2,
+        num_local_experts=8,
+    )
+    with pytest.raises(ValueError, match="requires a one-element"):
+        CuteDslFusedMoERunner(**kwargs, activation_type=ActivationType.ClampedRelu2)
+    with pytest.raises(ValueError, match="supported only with .*ClampedRelu2"):
+        CuteDslFusedMoERunner(
+            **kwargs,
+            activation_type=ActivationType.Relu2,
+            clamped_relu2_limit=_cpu_limit(),
+        )
+    # W4A16 has its own kernel without a ClampedRelu2 epilogue.
+    with pytest.raises(ValueError, match="Unsupported activation_type"):
+        CuteDslFusedMoEW4A16Runner(
+            num_experts=8,
+            top_k=2,
+            num_local_experts=8,
+            activation_type=ActivationType.ClampedRelu2,
+        )
+    if not torch.cuda.is_available():
+        pytest.skip("a valid clamped_relu2_limit is a CUDA tensor")
+
+    def limit(value):
+        return torch.tensor([value], dtype=torch.float32, device="cuda")
+
+    with pytest.raises(ValueError, match="does not accept SwiGLU"):
+        CuteDslFusedMoERunner(
+            **kwargs,
+            activation_type=ActivationType.ClampedRelu2,
+            clamped_relu2_limit=limit(1.0),
+            swiglu_limit=7.0,
+        )
+    relu2 = CuteDslFusedMoERunner(**kwargs, activation_type=ActivationType.Relu2)
+    clamped = {
+        (quant_mode, value): CuteDslFusedMoERunner(
+            **kwargs,
+            activation_type=ActivationType.ClampedRelu2,
+            clamped_relu2_limit=limit(value),
+            quant_mode=quant_mode,
+        )
+        for quant_mode in ("w4a4", "w4a8", "mxfp8")
+        for value in (1.0, 2.0)
+    }
+    assert all(not runner.gated for runner in clamped.values())
+    # The activation type distinguishes ClampedRelu2 from Relu2 ...
+    assert hash(relu2) != hash(clamped[("w4a4", 1.0)])
+    assert relu2.get_cache_key_extras([]) != clamped[
+        ("w4a4", 1.0)
+    ].get_cache_key_extras([])
+    # ... but the limit is a runtime input: its value does not change the key.
+    for quant_mode in ("w4a4", "w4a8", "mxfp8"):
+        a, b = clamped[(quant_mode, 1.0)], clamped[(quant_mode, 2.0)]
+        assert hash(a) == hash(b)
+        assert a.get_cache_key_extras([]) == b.get_cache_key_extras([])
 
 
 @pytest.mark.parametrize("quant_mode", _MOE_QUANT_MODES)
@@ -2223,6 +2364,106 @@ class TestCuteDslFusedMoeFunctional:
         assert passed, (
             f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
         )
+
+    @pytest.mark.parametrize("use_per_token_activation", [False, True])
+    def test_clamped_relu2_accuracy(self, use_per_token_activation: bool):
+        """Accuracy test for the non-gated clamped ReLU^2 (W4A4)."""
+        from flashinfer import cute_dsl_fused_moe
+
+        if is_sm107():
+            pytest.skip("SM107 gather grouped GEMM does not implement ClampedRelu2")
+
+        activation_type = ActivationType.ClampedRelu2
+        num_tokens, hidden_size, intermediate_size = 128, 1024, 512
+        num_experts, top_k = 32, 2
+        # The FC1 output has std ~0.3 here, so this limit clamps most of the
+        # positive outputs.
+        clamped_relu2_limit = torch.tensor([0.25], dtype=torch.float32, device="cuda")
+
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+            gated=False,
+            use_per_token_activation=use_per_token_activation,
+        )
+        api_inputs, reference_inputs = _prepare_moe_quant_mode_inputs(tensors, "w4a4")
+
+        result = cute_dsl_fused_moe(
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            num_experts=num_experts,
+            top_k=top_k,
+            activation_type=activation_type,
+            quant_mode="w4a4",
+            clamped_relu2_limit=clamped_relu2_limit,
+            **api_inputs,
+        )
+        assert result.shape == (num_tokens, hidden_size)
+        assert not torch.isnan(result).any()
+        assert not torch.isinf(result).any()
+
+        reference_kwargs = dict(
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            **reference_inputs,
+        )
+        ref_output = compute_reference_moe_fp4(
+            activation_type=activation_type,
+            clamped_relu2_limit=clamped_relu2_limit,
+            **reference_kwargs,
+        )
+        relu2_ref_output = compute_reference_moe_fp4(
+            activation_type=ActivationType.Relu2, **reference_kwargs
+        )
+
+        passed, percent_within, atol = check_accuracy(result, ref_output)
+        assert passed, (
+            f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
+        )
+        # The clamp must be active: the output is clearly closer to the clamped
+        # reference than to plain ReLU^2.
+        clamped_error = torch.mean(torch.abs(result.float() - ref_output)).item()
+        relu2_error = torch.mean(torch.abs(result.float() - relu2_ref_output)).item()
+        assert clamped_error < 0.5 * relu2_error, (
+            f"ClampedRelu2 output is not closer to its reference "
+            f"({clamped_error:.4f}) than to the ReLU^2 reference ({relu2_error:.4f})"
+        )
+
+        # W4A16 has no ClampedRelu2 epilogue and rejects it up front.
+        with pytest.raises(ValueError, match="not supported when quant_mode='w4a16'"):
+            cute_dsl_fused_moe(
+                x=tensors["x_bf16"],
+                x_sf=None,
+                token_selected_experts=tensors["token_selected_experts"],
+                token_final_scales=tensors["token_final_scales"],
+                w1_weight=tensors["w1_weight"],
+                w1_weight_sf=tensors["w1_weight_sf"],
+                w1_alpha=tensors["w1_alpha"],
+                fc2_input_scale=None,
+                w2_weight=tensors["w2_weight"],
+                w2_weight_sf=tensors["w2_weight_sf"],
+                w2_alpha=tensors["w2_alpha"],
+                num_experts=num_experts,
+                top_k=top_k,
+                activation_type=activation_type,
+                quant_mode="w4a16",
+                clamped_relu2_limit=clamped_relu2_limit,
+            )
 
     @pytest.mark.parametrize(
         "quant_mode,use_per_token_activation", _MOE_QUANT_MODE_CASES

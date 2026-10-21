@@ -23,8 +23,15 @@ from typing import Dict, Optional, Tuple, Union
 import torch
 
 from ...jit.moe_utils import gen_moe_utils_module
-from ...tllm_enums import ActivationType, is_gated_activation, normalize_activation_type
-from ...utils import get_compute_capability
+from ...tllm_enums import (
+    ActivationType,
+    DEFAULT_SWIGLU_ALPHA,
+    DEFAULT_SWIGLU_BETA,
+    DEFAULT_SWIGLU_LIMIT,
+    is_gated_activation,
+    normalize_activation_type,
+)
+from ...utils import check_shape_dtype_device, get_compute_capability
 
 
 def _get_cuda_stream_ptr() -> int:
@@ -56,15 +63,36 @@ SUPPORTED_CUTE_DSL_MOE_ACTIVATION_TYPES = (
     ActivationType.Swiglu,
     ActivationType.GegluTanh,
     ActivationType.Relu2,
+    ActivationType.ClampedRelu2,
 )
+
+
+# Activations implemented only by the SM100/SM103 block-scaled (W4A4, W4A8 and
+# MXFP8) GEMM1 epilogue. Callers on that path opt in through
+# ``normalize_cute_dsl_moe_activation_type(..., allow_clamped_relu2=True)``;
+# every other CuTe-DSL MoE path (SM90, W4A16) keeps rejecting them.
+_BLOCKSCALED_ONLY_CUTE_DSL_MOE_ACTIVATION_TYPES = (ActivationType.ClampedRelu2,)
 
 
 def normalize_cute_dsl_moe_activation_type(
     activation_type: Union[int, ActivationType],
+    *,
+    allow_clamped_relu2: bool = False,
 ) -> Tuple[ActivationType, bool]:
+    """Normalize and validate a CuTe-DSL MoE activation type.
+
+    Returns ``(activation_type, gated)``. ``ActivationType.ClampedRelu2`` (a
+    non-gated activation) is accepted only when ``allow_clamped_relu2`` is set.
+    """
     activation_type = normalize_activation_type(activation_type)
-    if activation_type not in SUPPORTED_CUTE_DSL_MOE_ACTIVATION_TYPES:
-        expected = " or ".join(repr(t) for t in SUPPORTED_CUTE_DSL_MOE_ACTIVATION_TYPES)
+    supported = tuple(
+        t
+        for t in SUPPORTED_CUTE_DSL_MOE_ACTIVATION_TYPES
+        if allow_clamped_relu2
+        or t not in _BLOCKSCALED_ONLY_CUTE_DSL_MOE_ACTIVATION_TYPES
+    )
+    if activation_type not in supported:
+        expected = " or ".join(repr(t) for t in supported)
         raise ValueError(
             f"Unsupported activation_type {activation_type!r}; expected {expected}"
         )
@@ -104,6 +132,78 @@ def validate_cute_dsl_moe_situ_config(
     ):
         raise ValueError(
             "situ_linear_beta must be positive and finite in fp32 when set"
+        )
+
+
+def validate_cute_dsl_moe_clamped_relu2(
+    activation_type: Union[int, ActivationType],
+    clamped_relu2_limit: Optional[torch.Tensor],
+    device: Optional[torch.device] = None,
+    *,
+    swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
+    swiglu_beta: float = DEFAULT_SWIGLU_BETA,
+    swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
+    situ_beta: Optional[float] = None,
+    situ_linear_beta: Optional[float] = None,
+) -> None:
+    """Validate the limit of the non-gated clamped ReLU^2 epilogue.
+
+    ``ActivationType.ClampedRelu2`` computes ``relu(L * tanh(x / L)) ** 2``
+    (equivalently ``(L * tanh(relu(x) / L)) ** 2``) on the alpha-scaled FC1
+    accumulator. As in the CUTLASS fused MoE, ``L`` is a model-wide positive
+    clamp scale given as a one-element float32 CUDA tensor of shape ``(1,)``
+    that the kernel reads at runtime; it is required with ``ClampedRelu2`` and
+    rejected for every other activation. The checks and error text mirror
+    :func:`flashinfer.fused_moe.cutlass_fused_moe`; like there, the value is
+    not inspected on the host (that would need a device sync).
+
+    ``device`` is the device the limit must live on. When ``None`` (no input
+    tensor is known yet), only a CUDA tensor is required.
+    """
+    if int(activation_type) == int(ActivationType.ClampedRelu2):
+        if clamped_relu2_limit is None:
+            raise ValueError(
+                "ActivationType.ClampedRelu2 requires a one-element "
+                "clamped_relu2_limit tensor"
+            )
+        if not isinstance(clamped_relu2_limit, torch.Tensor):
+            raise TypeError(
+                "clamped_relu2_limit must be a torch.Tensor, got "
+                f"{type(clamped_relu2_limit).__name__}"
+            )
+        if clamped_relu2_limit.ndim != 1 or clamped_relu2_limit.numel() != 1:
+            raise ValueError(
+                "ActivationType.ClampedRelu2 requires model-wide "
+                "clamped_relu2_limit with shape (1,), got "
+                f"{tuple(clamped_relu2_limit.shape)}"
+            )
+        check_shape_dtype_device(
+            clamped_relu2_limit,
+            (1,),
+            torch.float32,
+            device,
+            "ClampedRelu2 clamped_relu2_limit",
+        )
+        if device is None and clamped_relu2_limit.device.type != "cuda":
+            raise ValueError(
+                "Invalid device of ClampedRelu2 clamped_relu2_limit: expected a "
+                f"CUDA tensor, got {clamped_relu2_limit.device}"
+            )
+        if (swiglu_alpha, swiglu_beta, swiglu_limit) != (
+            DEFAULT_SWIGLU_ALPHA,
+            DEFAULT_SWIGLU_BETA,
+            DEFAULT_SWIGLU_LIMIT,
+        ):
+            raise ValueError(
+                "ActivationType.ClampedRelu2 does not accept SwiGLU activation parameters"
+            )
+        if situ_beta is not None or situ_linear_beta is not None:
+            raise ValueError(
+                "ActivationType.ClampedRelu2 does not accept SiTU activation parameters"
+            )
+    elif clamped_relu2_limit is not None:
+        raise ValueError(
+            "clamped_relu2_limit is supported only with ActivationType.ClampedRelu2"
         )
 
 

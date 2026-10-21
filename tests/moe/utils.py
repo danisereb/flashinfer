@@ -581,6 +581,7 @@ def compute_reference_moe_fp4(
     wrong_formula: bool = False,
     gemm1_alpha: torch.Tensor | None = None,
     gemm2_alpha: torch.Tensor | None = None,
+    clamped_relu2_limit: float | torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute reference MoE output using PyTorch operations on GPU.
 
@@ -612,6 +613,9 @@ def compute_reference_moe_fp4(
         situ_linear_beta: Optional SiTU tanh clamp for the linear branch.
         gemm1_alpha: GEMM1 per-expert scalar scales [num_local_experts]
         gemm2_alpha: GEMM2 per-expert scalar scales [num_local_experts]
+        clamped_relu2_limit: Limit ``L`` of ActivationType.ClampedRelu2 (a float
+            or a one-element tensor), which maps the alpha-scaled GEMM1 output
+            ``z`` to ``relu(L * tanh(z / L)) ** 2``.
 
     Returns:
         Output tensor [num_tokens, hidden_size]
@@ -621,11 +625,17 @@ def compute_reference_moe_fp4(
         swiglu_limit = 7.0 if swiglu_limit is None else swiglu_limit
     if activation is None:
         normalized_activation_type, gated = normalize_cute_dsl_moe_activation_type(
-            activation_type
+            activation_type, allow_clamped_relu2=True
         )
         validate_cute_dsl_moe_situ_config(
             normalized_activation_type, situ_beta, situ_linear_beta
         )
+        if (normalized_activation_type == ActivationType.ClampedRelu2) != (
+            clamped_relu2_limit is not None
+        ):
+            raise ValueError("clamped_relu2_limit is required with ClampedRelu2 only")
+        if isinstance(clamped_relu2_limit, torch.Tensor):
+            clamped_relu2_limit = float(clamped_relu2_limit.item())
         if situ_beta is not None:
             activation = "situ"
         elif normalized_activation_type == ActivationType.GegluTanh:
@@ -731,6 +741,10 @@ def compute_reference_moe_fp4(
                 # non-gated activation over identical weights. Used as a
                 # negative control to prove a tolerance can distinguish
                 # activation formulas rather than just output magnitude.
+                if clamped_relu2_limit is not None:
+                    gemm1_out = clamped_relu2_limit * torch.tanh(
+                        gemm1_out / clamped_relu2_limit
+                    )
                 act_out = (
                     torch.relu(gemm1_out)
                     if wrong_formula

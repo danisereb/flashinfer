@@ -470,8 +470,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         :type enable_pdl: bool
         :param activation_type: FC1 activation type. Use ActivationType.Swiglu
             for gated SwiGLU/OAI/SiTU, ActivationType.GegluTanh for
-            tanh-approximate GeGLU, and ActivationType.Relu2 for non-gated
-            ReLU^2. Setting situ_beta selects SiTU.
+            tanh-approximate GeGLU, ActivationType.Relu2 for non-gated
+            ReLU^2, and ActivationType.ClampedRelu2 for non-gated clamped
+            ReLU^2 (its limit is a runtime tensor passed at launch). Setting
+            situ_beta selects SiTU.
         :type activation_type: int
         :param swiglu_alpha: Sigmoid multiplier for parameterized SwiGLU.
         :type swiglu_alpha: float
@@ -485,7 +487,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         :param situ_linear_beta: Optional SiTU tanh clamp for the up branch.
         :type situ_linear_beta: Optional[float]
         :param gated: Whether GEMM1 output is split into up/gate halves. If
-            False, the epilogue computes non-gated ReLU^2.
+            False, the epilogue computes non-gated (clamped) ReLU^2.
         :type gated: bool
         """
 
@@ -574,7 +576,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         self.num_tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
 
         activation_type, expected_gated = normalize_cute_dsl_moe_activation_type(
-            activation_type
+            activation_type, allow_clamped_relu2=True
         )
         if gated != expected_gated:
             raise ValueError(
@@ -588,6 +590,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         self.swiglu_limit = swiglu_limit
         self.situ_beta = situ_beta
         self.situ_linear_beta = situ_linear_beta
+        # Compile-time switch only; the limit itself is read at runtime from
+        # the clamped_relu2_limit tensor, so its value is not specialized.
+        self.use_clamped_relu2 = activation_type == ActivationType.ClampedRelu2
 
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
@@ -813,6 +818,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
+        clamped_relu2_limit: Optional[cute.Tensor] = None,
     ):
         """Execute the contiguous grouped GEMM with gather operation and SwiGLU fusion.
 
@@ -878,6 +884,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         :type stream: cuda.CUstream
         :param epilogue_op: Optional elementwise lambda function to apply to the output tensor
         :type epilogue_op: cutlass.Constexpr
+        :param clamped_relu2_limit: One-element float32 tensor holding the
+            ActivationType.ClampedRelu2 limit ``L``, read at runtime. Required
+            with ClampedRelu2 and must be None otherwise.
+        :type clamped_relu2_limit: Optional[cute.Tensor]
         :raises TypeError: If input data types are incompatible with the MMA instruction.
         """
         # Setup static attributes before smem/grid/tma computation
@@ -909,6 +919,14 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         # ((Atom_N, Rest_N),(Atom_K, Rest_K),RestL)
         sfb_layout = blockscaled_utils.tile_atom_to_shape_SF(b.shape, self.sf_vec_size)
         sfb = cute.make_tensor(sfb.iterator, sfb_layout)
+
+        if cutlass.const_expr(
+            self.use_clamped_relu2 != (clamped_relu2_limit is not None)
+        ):
+            raise ValueError(
+                "clamped_relu2_limit is required with ActivationType.ClampedRelu2 "
+                "and must be None otherwise"
+            )
 
         # Setup sfc tensor by filling C tensor to scale factor atom layout
         self.generate_sfc = sfc_tensor is not None
@@ -1173,6 +1191,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             num_non_exiting_tiles,
             alpha,
             a_per_token_scale,
+            clamped_relu2_limit,
             self.cluster_layout_vmnk,
             self.cluster_layout_sfb_vmnk,
             self.a_smem_layout_staged,
@@ -1260,6 +1279,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         num_non_exiting_tiles: cute.Tensor,
         alpha: cute.Tensor,
         a_per_token_scale: Optional[cute.Tensor],
+        clamped_relu2_limit: Optional[cute.Tensor],
         cluster_layout_vmnk: cute.Layout,
         cluster_layout_sfb_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
@@ -2608,6 +2628,12 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 )
                 tCrSFC_pvscale = cute.make_rmem_tensor_like(tCrSFC, cutlass.Float32)
 
+            # ClampedRelu2 limit L: read once per CTA (like norm_const above);
+            # the reciprocal is computed once here, not per element.
+            if cutlass.const_expr(self.use_clamped_relu2):
+                clamp_limit = clamped_relu2_limit[0]
+                inv_clamp_limit = cutlass.Float32(1.0) / clamp_limit
+
             #
             # Persistent tile scheduling loop
             #
@@ -2773,6 +2799,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                     if cutlass.const_expr(not self.gated):
                         acc_vec = tTR_rAcc_up.load()
                         tCompute = cute.make_rmem_tensor(acc_vec.shape, self.acc_dtype)
+                        # ClampedRelu2: relu(L * tanh(x / L)) ** 2 on the
+                        # alpha-scaled accumulator x, with L read at runtime.
                         if cutlass.const_expr(self.vectorized_f32):
                             for i in cutlass.range_constexpr(
                                 0, cute.size(tTR_rAcc_up), 2
@@ -2784,6 +2812,19 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                                         cutlass.Float32(alpha_val),
                                     ),
                                 )
+                                if cutlass.const_expr(self.use_clamped_relu2):
+                                    acc_alpha = (
+                                        clamp_limit
+                                        * tanh_f32(
+                                            acc_alpha[0] * inv_clamp_limit,
+                                            fastmath=True,
+                                        ),
+                                        clamp_limit
+                                        * tanh_f32(
+                                            acc_alpha[1] * inv_clamp_limit,
+                                            fastmath=True,
+                                        ),
+                                    )
                                 r0 = cute.arch.fmax(acc_alpha[0], cutlass.Float32(0.0))
                                 r1 = cute.arch.fmax(acc_alpha[1], cutlass.Float32(0.0))
                                 (
@@ -2793,6 +2834,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         else:
                             for i in cutlass.range_constexpr(cute.size(tTR_rAcc_up)):
                                 v = acc_vec[i] * cutlass.Float32(alpha_val)
+                                if cutlass.const_expr(self.use_clamped_relu2):
+                                    v = clamp_limit * tanh_f32(
+                                        v * inv_clamp_limit, fastmath=True
+                                    )
                                 v = cute.arch.fmax(v, cutlass.Float32(0.0))
                                 tCompute[i] = v * v
                     else:
@@ -4025,6 +4070,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         num_non_exiting_tiles_ptr: cute.Pointer,
         global_sf_ptr: Optional[cute.Pointer],
         a_per_token_scale_ptr: Optional[cute.Pointer],
+        clamped_relu2_limit_ptr: Optional[cute.Pointer],
         orig_m: cutlass.Int64,
         m: cutlass.Int64,
         n: cutlass.Int64,
@@ -4100,6 +4146,11 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             if cutlass.const_expr(global_sf_ptr is not None)
             else None
         )
+        clamped_relu2_limit = (
+            cute.make_tensor(clamped_relu2_limit_ptr, layout=cute.make_layout((1,)))
+            if cutlass.const_expr(clamped_relu2_limit_ptr is not None)
+            else None
+        )
 
         return self(
             a,
@@ -4118,6 +4169,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             max_active_clusters=max_active_clusters,
             stream=stream,
             epilogue_op=epilogue_op,
+            clamped_relu2_limit=clamped_relu2_limit,
         )
 
 

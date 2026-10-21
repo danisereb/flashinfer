@@ -90,6 +90,7 @@ from .moe_utils import (
     moe_output_memset_inplace,
     moe_sort,
     normalize_cute_dsl_moe_activation_type,
+    validate_cute_dsl_moe_clamped_relu2,
     validate_cute_dsl_moe_situ_config,
 )
 from .blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
@@ -373,6 +374,7 @@ def _moe_core_impl(
     situ_linear_beta: Optional[float] = None,
     nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
     weight_dtype: Optional[str] = None,
+    clamped_relu2_limit: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Core MoE implementation shared by functional and wrapper APIs.
 
@@ -432,14 +434,18 @@ def _moe_core_impl(
         activation_type: Activation type to apply after GEMM1. Use
             ActivationType.Swiglu for gated SwiGLU/OAI/SiTU,
             ActivationType.GegluTanh for tanh-approximate GeGLU, and
-            ActivationType.Relu2 for non-gated mode. Setting situ_beta selects
-            SiTU; swiglu_oai is represented as Swiglu with non-default
-            swiglu_alpha/beta/limit.
+            ActivationType.Relu2 or ActivationType.ClampedRelu2 for non-gated
+            mode. Setting situ_beta selects SiTU; swiglu_oai is represented as
+            Swiglu with non-default swiglu_alpha/beta/limit.
         swiglu_alpha: SwiGLU sigmoid multiplier.
         swiglu_beta: SwiGLU up-projection bias.
         swiglu_limit: SwiGLU clamp limit.
         situ_beta: When set with ActivationType.Swiglu, use the SiTU gate.
         situ_linear_beta: Optional SiTU tanh clamp for the up branch.
+        clamped_relu2_limit: Model-wide clamp scale ``L`` for
+            ActivationType.ClampedRelu2 (``relu(L * tanh(x / L)) ** 2`` on the
+            alpha-scaled FC1 output), a one-element float32 CUDA tensor read
+            at runtime; required with it and rejected otherwise.
         nvfp4_4over6: NVFP4 4over6 recipe for the GEMM2-input quantization.
             - omitted (the default): read FLASHINFER_NVFP4_4OVER6* on every
               call.
@@ -454,7 +460,9 @@ def _moe_core_impl(
     Returns:
         Output tensor [num_tokens, hidden_size].
     """
-    activation, gated = normalize_cute_dsl_moe_activation_type(activation_type)
+    activation, gated = normalize_cute_dsl_moe_activation_type(
+        activation_type, allow_clamped_relu2=True
+    )
     is_mxfp8 = x.dtype == torch.float8_e4m3fn
     if weight_dtype is None:
         # The localized (W4A4-only) path passes w1_weight=None; its shards are FP4.
@@ -487,6 +495,16 @@ def _moe_core_impl(
         raise ValueError("quant_mode='w4a8' requires use_fused_finalize=True")
     if is_mxfp8 and (situ_beta is not None or situ_linear_beta is not None):
         raise ValueError("SiTU is not supported when quant_mode='w4a8'")
+    validate_cute_dsl_moe_clamped_relu2(
+        activation,
+        clamped_relu2_limit,
+        x.device,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        swiglu_limit=swiglu_limit,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+    )
     validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
     if is_mxfp8:
         validate_w4a8_inputs(
@@ -720,6 +738,7 @@ def _moe_core_impl(
                 situ_beta=situ_beta,
                 situ_linear_beta=situ_linear_beta,
                 gated=gated,
+                clamped_relu2_limit=clamped_relu2_limit,
             )
 
         localized_memset_done = None
@@ -780,6 +799,7 @@ def _moe_core_impl(
                 situ_beta=situ_beta,
                 situ_linear_beta=situ_linear_beta,
                 gated=gated,
+                clamped_relu2_limit=clamped_relu2_limit,
             )
         )
     if use_per_token_activation:
@@ -987,6 +1007,7 @@ class CuteDslMoEWrapper:
         situ_linear_beta: Optional[float] = None,
         use_fused_finalize: bool = True,
         quant_mode: str = "w4a4",
+        clamped_relu2_limit: Optional[torch.Tensor] = None,
     ):
         r"""Configure the CuTe-DSL block-scaled fused-MoE wrapper.
 
@@ -1025,8 +1046,10 @@ class CuteDslMoEWrapper:
         activation_type : int
             FC1 activation type. Use ``ActivationType.Swiglu`` for gated
             SwiGLU/SiTU, ``ActivationType.GegluTanh`` for tanh-approximate
-            GeGLU, and ``ActivationType.Relu2`` for non-gated ReLU^2. Setting
-            ``situ_beta`` selects SiTU.
+            GeGLU, ``ActivationType.Relu2`` for non-gated ReLU^2, and
+            ``ActivationType.ClampedRelu2`` for non-gated clamped ReLU^2
+            (requires ``clamped_relu2_limit``). Setting ``situ_beta`` selects
+            SiTU.
         swiglu_alpha, swiglu_beta, swiglu_limit : float
             SwiGLU parameters. ``swiglu_oai`` is represented as
             ``ActivationType.Swiglu`` with non-default values.
@@ -1042,10 +1065,36 @@ class CuteDslMoEWrapper:
             Compute mode: ``"w4a4"``, ``"w4a8"``, or ``"w4a16"``.
             Defaults to ``"w4a4"``. ``"nvfp4"`` is a deprecated alias for
             ``"w4a4"``.
+        clamped_relu2_limit : Optional[torch.Tensor]
+            Model-wide positive clamp scale ``L`` for
+            ``ActivationType.ClampedRelu2``, provided as a one-element float32
+            CUDA tensor of shape ``(1,)``, as in :func:`cutlass_fused_moe`.
+            ClampedRelu2 computes ``relu(L * tanh(x / L)) ** 2`` on the
+            alpha-scaled FC1 output ``x`` (equivalently
+            ``(L * tanh(relu(x) / L)) ** 2``). The kernel reads the tensor at
+            runtime, so its value may be updated in place (e.g. between CUDA
+            graph replays) without recompiling. Required with ``ClampedRelu2``
+            and rejected for every other activation. Not supported by
+            ``"w4a16"`` or on SM107.
         """
-        activation, gated = normalize_cute_dsl_moe_activation_type(activation_type)
+        activation, gated = normalize_cute_dsl_moe_activation_type(
+            activation_type, allow_clamped_relu2=True
+        )
         quant_mode = _canonicalize_quant_mode(quant_mode)
+        validate_cute_dsl_moe_clamped_relu2(
+            activation,
+            clamped_relu2_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            swiglu_limit=swiglu_limit,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+        )
         validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
+        if quant_mode == "w4a16" and activation == ActivationType.ClampedRelu2:
+            raise ValueError(
+                "ActivationType.ClampedRelu2 is not supported when quant_mode='w4a16'"
+            )
         self.num_experts = num_experts
         self.top_k = top_k
         self.hidden_size = hidden_size
@@ -1065,6 +1114,7 @@ class CuteDslMoEWrapper:
         self.swiglu_limit = swiglu_limit
         self.situ_beta = situ_beta
         self.situ_linear_beta = situ_linear_beta
+        self.clamped_relu2_limit = clamped_relu2_limit
         self.use_fused_finalize = use_fused_finalize
         self.quant_mode = quant_mode
         if quant_mode == "w4a8":
@@ -1081,6 +1131,16 @@ class CuteDslMoEWrapper:
                 and torch.cuda.get_device_capability(device_obj) == (10, 7)
             ):
                 raise ValueError("quant_mode='w4a8' is not supported on SM107")
+        if activation == ActivationType.ClampedRelu2:
+            device_obj = torch.device(device)
+            if (
+                device_obj.type == "cuda"
+                and torch.cuda.is_available()
+                and torch.cuda.get_device_capability(device_obj) == (10, 7)
+            ):
+                raise ValueError(
+                    "ActivationType.ClampedRelu2 is not supported on SM107"
+                )
 
         # Persistent CUDA resources for async-memset / GEMM1 overlap. These
         # are created outside graph capture (so they can be reused inside it)
@@ -1124,6 +1184,7 @@ class CuteDslMoEWrapper:
                 situ_linear_beta=situ_linear_beta,
                 use_per_token_activation=False,
                 quant_mode=quant_mode,
+                clamped_relu2_limit=clamped_relu2_limit,
             )
             if quant_mode == "w4a4":
                 self._per_token_runner = CuteDslFusedMoERunner(
@@ -1143,6 +1204,7 @@ class CuteDslMoEWrapper:
                     situ_linear_beta=situ_linear_beta,
                     use_per_token_activation=True,
                     quant_mode=quant_mode,
+                    clamped_relu2_limit=clamped_relu2_limit,
                 )
 
             if use_cuda_graph:
@@ -1248,6 +1310,7 @@ class CuteDslMoEWrapper:
             swiglu_limit=self.swiglu_limit,
             situ_beta=self.situ_beta,
             situ_linear_beta=self.situ_linear_beta,
+            clamped_relu2_limit=self.clamped_relu2_limit,
         )
 
     @flashinfer_api(trace=cute_dsl_moe_wrapper_run_trace)
@@ -1474,6 +1537,7 @@ def _cute_dsl_fused_moe_impl(
     localized_weights: Optional[list] = None,
     localized_streams: Optional[list] = None,
     sm_count: Optional[int] = None,
+    clamped_relu2_limit: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Internal implementation called by auto-tuner for functional API."""
     return _moe_core_impl(
@@ -1519,6 +1583,7 @@ def _cute_dsl_fused_moe_impl(
         localized_weights=localized_weights,
         localized_streams=localized_streams,
         sm_count=sm_count,
+        clamped_relu2_limit=clamped_relu2_limit,
     )
 
 
@@ -1563,6 +1628,7 @@ def cute_dsl_fused_moe(
     localized_memset_stream: Optional[torch.cuda.Stream] = None,
     localized_allow_nonlocalized: bool = False,
     autotune_use_cuda_graph: bool = False,
+    clamped_relu2_limit: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""Run a fused MoE forward pass using CuTe-DSL block-scaled kernels.
 
@@ -1626,9 +1692,11 @@ def cute_dsl_fused_moe(
     activation_type : int
         FC1 activation type. Use ``ActivationType.Swiglu`` for gated
         SwiGLU/SiTU, ``ActivationType.GegluTanh`` for tanh-approximate GeGLU,
-        and ``ActivationType.Relu2`` for non-gated ReLU^2. Setting
-        ``situ_beta`` selects SiTU; ``swiglu_oai`` is represented as
-        ``ActivationType.Swiglu`` with non-default ``swiglu_alpha/beta/limit``.
+        ``ActivationType.Relu2`` for non-gated ReLU^2, and
+        ``ActivationType.ClampedRelu2`` for non-gated clamped ReLU^2 (requires
+        ``clamped_relu2_limit``). Setting ``situ_beta`` selects SiTU;
+        ``swiglu_oai`` is represented as ``ActivationType.Swiglu`` with
+        non-default ``swiglu_alpha/beta/limit``.
     swiglu_alpha, swiglu_beta, swiglu_limit : float
         SwiGLU parameters.
     quant_mode : str
@@ -1643,6 +1711,18 @@ def cute_dsl_fused_moe(
         ``beta * tanh(gate / beta) * sigmoid(gate)``.
     situ_linear_beta : Optional[float]
         Optional SiTU tanh clamp for the up branch.
+    clamped_relu2_limit : Optional[torch.Tensor]
+        Model-wide positive clamp scale ``L`` for
+        ``ActivationType.ClampedRelu2``, provided as a one-element float32
+        CUDA tensor of shape ``(1,)`` on the device of ``x``, as in
+        :func:`cutlass_fused_moe`. ClampedRelu2 computes
+        ``relu(L * tanh(x / L)) ** 2`` on the alpha-scaled FC1 output ``x``
+        (equivalently ``(L * tanh(relu(x) / L)) ** 2``, the CUTLASS MoE
+        ``ClampedRelu2``). The kernel reads the tensor at runtime, so the
+        compiled kernel does not depend on its value. Required with
+        ``ClampedRelu2`` and rejected for every other activation. Supported
+        by ``"w4a4"``, ``"w4a8"`` and ``"mxfp8"``; not by ``"w4a16"`` or on
+        SM107.
     per_token_scale : Optional[torch.Tensor]
         Optional W4A4 per-token input row scale for GEMM1.
     tactic : Optional[Tuple]
@@ -1717,9 +1797,25 @@ def cute_dsl_fused_moe(
         Output tensor of shape ``[num_tokens, hidden_size]``.
     """
     _require_cute_dsl_arch_for(x.device, native_only=True)
-    activation, _ = normalize_cute_dsl_moe_activation_type(activation_type)
+    activation, _ = normalize_cute_dsl_moe_activation_type(
+        activation_type, allow_clamped_relu2=True
+    )
     quant_mode = _canonicalize_quant_mode(quant_mode)
+    validate_cute_dsl_moe_clamped_relu2(
+        activation,
+        clamped_relu2_limit,
+        x.device,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        swiglu_limit=swiglu_limit,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+    )
     validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
+    if quant_mode == "w4a16" and activation == ActivationType.ClampedRelu2:
+        raise ValueError(
+            "ActivationType.ClampedRelu2 is not supported when quant_mode='w4a16'"
+        )
 
     if quant_mode == "w4a8":
         if x.dtype is not torch.float8_e4m3fn:
@@ -1735,6 +1831,10 @@ def cute_dsl_fused_moe(
             raise ValueError("quant_mode='mxfp8' is not supported on SM107")
     elif quant_mode == "w4a4" and x.dtype is not torch.uint8:
         raise TypeError("quant_mode='w4a4' requires packed uint8 input")
+    if activation == ActivationType.ClampedRelu2 and torch.cuda.get_device_capability(
+        x.device
+    ) == (10, 7):
+        raise ValueError("ActivationType.ClampedRelu2 is not supported on SM107")
 
     if num_local_experts is None:
         num_local_experts = num_experts
@@ -1787,6 +1887,7 @@ def cute_dsl_fused_moe(
             use_per_token_activation=use_per_token_activation,
             quant_mode=quant_mode,
             use_cuda_graph=autotune_use_cuda_graph,
+            clamped_relu2_limit=clamped_relu2_limit,
         )
         if localized_weights is None:
             runners = [CuteDslFusedMoERunner(**runner_kwargs)]
@@ -1933,6 +2034,7 @@ def cute_dsl_fused_moe_nvfp4(
     localized_memset_stream: Optional[torch.cuda.Stream] = None,
     localized_allow_nonlocalized: bool = False,
     autotune_use_cuda_graph: bool = False,
+    clamped_relu2_limit: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""Run a fused MoE forward pass using the CuTe-DSL NVFP4 kernels.
 
@@ -1985,6 +2087,7 @@ def cute_dsl_fused_moe_nvfp4(
         localized_memset_stream=localized_memset_stream,
         localized_allow_nonlocalized=localized_allow_nonlocalized,
         autotune_use_cuda_graph=autotune_use_cuda_graph,
+        clamped_relu2_limit=clamped_relu2_limit,
     )
 
 
