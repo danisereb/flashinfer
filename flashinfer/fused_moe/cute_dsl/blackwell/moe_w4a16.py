@@ -387,6 +387,15 @@ def launch_w4a16_moe(
     top_k = int(token_selected_experts.size(1))
     intermediate_size = int(w2_weight.size(2)) * 2
     activation_type, gated = normalize_cute_dsl_moe_activation_type(activation_type)
+    if activation_type not in (
+        ActivationType.Swiglu,
+        ActivationType.GegluTanh,
+        ActivationType.Relu2,
+    ):
+        raise ValueError(
+            f"Unsupported activation_type {activation_type!r} for W4A16; "
+            "expected Swiglu, GegluTanh or Relu2"
+        )
     validate_cute_dsl_moe_situ_config(activation_type, situ_beta, situ_linear_beta)
     gemm1_output_size = intermediate_size * (2 if gated else 1)
     if int(w1_weight.size(1)) != gemm1_output_size:

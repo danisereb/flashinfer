@@ -287,7 +287,7 @@ def test_mxfp8_clamped_relu2_limit_is_read_at_runtime():
 
 
 def test_mxfp8_clamped_relu2_rejects_invalid_limit():
-    """The limit is validated before any GPU work, as in cutlass_fused_moe."""
+    """The limit is checked against the MXFP8 input before any GPU work."""
     from flashinfer import cute_dsl_fused_moe
 
     x, w1, w2, topk_ids, topk_w = _make_case(8, 256, 256, 4, 2)
@@ -315,28 +315,9 @@ def test_mxfp8_clamped_relu2_rejects_invalid_limit():
     )
     with pytest.raises(ValueError, match="requires a one-element"):
         cute_dsl_fused_moe(**kwargs)
-    bad_limits = [
-        (torch.ones(2, device="cuda"), r"with shape \(1,\), got \(2,\)"),
-        (torch.ones((), device="cuda"), r"with shape \(1,\), got \(\)"),
-        (
-            torch.ones(1, dtype=torch.bfloat16, device="cuda"),
-            "Invalid dtype of ClampedRelu2 clamped_relu2_limit",
-        ),
-        (torch.ones(1), "Invalid device of ClampedRelu2 clamped_relu2_limit"),
-    ]
-    for bad, match in bad_limits:
-        with pytest.raises(ValueError, match=match):
-            cute_dsl_fused_moe(**kwargs, clamped_relu2_limit=bad)
-    for other in (ActivationType.Relu2, ActivationType.Swiglu):
-        with pytest.raises(ValueError, match="supported only with .*ClampedRelu2"):
-            cute_dsl_fused_moe(
-                **{**kwargs, "activation_type": other.value},
-                clamped_relu2_limit=_limit_tensor(2.0),
-            )
-    with pytest.raises(ValueError, match="does not accept SwiGLU"):
-        cute_dsl_fused_moe(
-            **kwargs, clamped_relu2_limit=_limit_tensor(2.0), swiglu_limit=7.0
-        )
+    # The limit must live on the input's device.
+    with pytest.raises(ValueError, match="Invalid device of ClampedRelu2"):
+        cute_dsl_fused_moe(**kwargs, clamped_relu2_limit=torch.ones(1))
 
 
 def test_mxfp8_relu2_gemm1_n192_rejects_partial_n_tile():

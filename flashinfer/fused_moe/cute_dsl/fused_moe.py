@@ -90,7 +90,7 @@ from .moe_utils import (
     moe_output_memset_inplace,
     moe_sort,
     normalize_cute_dsl_moe_activation_type,
-    validate_cute_dsl_moe_clamped_relu2,
+    validate_cute_dsl_moe_clamped_relu2_config,
     validate_cute_dsl_moe_situ_config,
 )
 from .blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
@@ -460,9 +460,7 @@ def _moe_core_impl(
     Returns:
         Output tensor [num_tokens, hidden_size].
     """
-    activation, gated = normalize_cute_dsl_moe_activation_type(
-        activation_type, allow_clamped_relu2=True
-    )
+    activation, gated = normalize_cute_dsl_moe_activation_type(activation_type)
     is_mxfp8 = x.dtype == torch.float8_e4m3fn
     if weight_dtype is None:
         # The localized (W4A4-only) path passes w1_weight=None; its shards are FP4.
@@ -495,15 +493,8 @@ def _moe_core_impl(
         raise ValueError("quant_mode='w4a8' requires use_fused_finalize=True")
     if is_mxfp8 and (situ_beta is not None or situ_linear_beta is not None):
         raise ValueError("SiTU is not supported when quant_mode='w4a8'")
-    validate_cute_dsl_moe_clamped_relu2(
-        activation,
-        clamped_relu2_limit,
-        x.device,
-        swiglu_alpha=swiglu_alpha,
-        swiglu_beta=swiglu_beta,
-        swiglu_limit=swiglu_limit,
-        situ_beta=situ_beta,
-        situ_linear_beta=situ_linear_beta,
+    validate_cute_dsl_moe_clamped_relu2_config(
+        activation, clamped_relu2_limit, x.device
     )
     validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
     if is_mxfp8:
@@ -1077,19 +1068,9 @@ class CuteDslMoEWrapper:
             and rejected for every other activation. Not supported by
             ``"w4a16"`` or on SM107.
         """
-        activation, gated = normalize_cute_dsl_moe_activation_type(
-            activation_type, allow_clamped_relu2=True
-        )
+        activation, gated = normalize_cute_dsl_moe_activation_type(activation_type)
         quant_mode = _canonicalize_quant_mode(quant_mode)
-        validate_cute_dsl_moe_clamped_relu2(
-            activation,
-            clamped_relu2_limit,
-            swiglu_alpha=swiglu_alpha,
-            swiglu_beta=swiglu_beta,
-            swiglu_limit=swiglu_limit,
-            situ_beta=situ_beta,
-            situ_linear_beta=situ_linear_beta,
-        )
+        validate_cute_dsl_moe_clamped_relu2_config(activation, clamped_relu2_limit)
         validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
         if quant_mode == "w4a16" and activation == ActivationType.ClampedRelu2:
             raise ValueError(
@@ -1797,19 +1778,10 @@ def cute_dsl_fused_moe(
         Output tensor of shape ``[num_tokens, hidden_size]``.
     """
     _require_cute_dsl_arch_for(x.device, native_only=True)
-    activation, _ = normalize_cute_dsl_moe_activation_type(
-        activation_type, allow_clamped_relu2=True
-    )
+    activation, _ = normalize_cute_dsl_moe_activation_type(activation_type)
     quant_mode = _canonicalize_quant_mode(quant_mode)
-    validate_cute_dsl_moe_clamped_relu2(
-        activation,
-        clamped_relu2_limit,
-        x.device,
-        swiglu_alpha=swiglu_alpha,
-        swiglu_beta=swiglu_beta,
-        swiglu_limit=swiglu_limit,
-        situ_beta=situ_beta,
-        situ_linear_beta=situ_linear_beta,
+    validate_cute_dsl_moe_clamped_relu2_config(
+        activation, clamped_relu2_limit, x.device
     )
     validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
     if quant_mode == "w4a16" and activation == ActivationType.ClampedRelu2:

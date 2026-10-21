@@ -376,6 +376,15 @@ def cute_dsl_fused_moe_bf16(
     if num_local_experts is None:
         num_local_experts = num_experts
     activation, _ = normalize_cute_dsl_moe_activation_type(activation_type)
+    if activation not in (
+        ActivationType.Swiglu,
+        ActivationType.GegluTanh,
+        ActivationType.Relu2,
+    ):
+        raise ValueError(
+            f"Unsupported activation_type {activation!r} for the SM90 CuTe-DSL MoE; "
+            "expected Swiglu, GegluTanh or Relu2"
+        )
     validate_cute_dsl_moe_swiglu_config(swiglu_alpha, swiglu_beta, swiglu_limit)
     validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
 
@@ -495,6 +504,15 @@ class CuteDslBf16MoEWrapper:
                 (requires ``situ_beta``).
         """
         activation, _ = normalize_cute_dsl_moe_activation_type(activation_type)
+        if activation not in (
+            ActivationType.Swiglu,
+            ActivationType.GegluTanh,
+            ActivationType.Relu2,
+        ):
+            raise ValueError(
+                f"Unsupported activation_type {activation!r} for the SM90 CuTe-DSL MoE; "
+                "expected Swiglu, GegluTanh or Relu2"
+            )
         validate_cute_dsl_moe_swiglu_config(swiglu_alpha, swiglu_beta, swiglu_limit)
         validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
         self.activation_type = int(activation)

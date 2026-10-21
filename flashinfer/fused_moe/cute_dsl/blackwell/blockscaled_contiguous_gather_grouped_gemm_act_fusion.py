@@ -576,7 +576,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         self.num_tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
 
         activation_type, expected_gated = normalize_cute_dsl_moe_activation_type(
-            activation_type, allow_clamped_relu2=True
+            activation_type
         )
         if gated != expected_gated:
             raise ValueError(
@@ -815,10 +815,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         num_non_exiting_tiles: cute.Tensor,
         alpha: cute.Tensor,
         a_per_token_scale: Optional[cute.Tensor],
+        clamped_relu2_limit: Optional[cute.Tensor],
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
-        clamped_relu2_limit: Optional[cute.Tensor] = None,
     ):
         """Execute the contiguous grouped GEMM with gather operation and SwiGLU fusion.
 
@@ -878,16 +878,16 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             shape (orig_m,). Indexed by the original token ID decoded from
             token_id_mapping_tensor. Only used when use_a_per_token_scale is true.
         :type a_per_token_scale: Optional[cute.Tensor]
+        :param clamped_relu2_limit: One-element float32 tensor holding the
+            ActivationType.ClampedRelu2 limit ``L``, read at runtime. Required
+            with ClampedRelu2 and must be None otherwise.
+        :type clamped_relu2_limit: Optional[cute.Tensor]
         :param max_active_clusters: Maximum number of active clusters
         :type max_active_clusters: cutlass.Constexpr
         :param stream: CUDA stream for asynchronous execution
         :type stream: cuda.CUstream
         :param epilogue_op: Optional elementwise lambda function to apply to the output tensor
         :type epilogue_op: cutlass.Constexpr
-        :param clamped_relu2_limit: One-element float32 tensor holding the
-            ActivationType.ClampedRelu2 limit ``L``, read at runtime. Required
-            with ClampedRelu2 and must be None otherwise.
-        :type clamped_relu2_limit: Optional[cute.Tensor]
         :raises TypeError: If input data types are incompatible with the MMA instruction.
         """
         # Setup static attributes before smem/grid/tma computation
@@ -4166,10 +4166,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             num_non_exiting_tiles,
             alpha,
             a_per_token_scale,
+            clamped_relu2_limit,
             max_active_clusters=max_active_clusters,
             stream=stream,
             epilogue_op=epilogue_op,
-            clamped_relu2_limit=clamped_relu2_limit,
         )
 
 

@@ -71,7 +71,7 @@ from flashinfer.cute_dsl.utils import (
 )
 from .moe_utils import (
     normalize_cute_dsl_moe_activation_type,
-    validate_cute_dsl_moe_clamped_relu2,
+    validate_cute_dsl_moe_clamped_relu2_config,
     validate_cute_dsl_moe_situ_config,
 )
 
@@ -241,6 +241,7 @@ def _get_compiled_gather_kernel(
     num_tiles_ptr,
     norm_const_ptr,
     a_per_token_scale_ptr,
+    clamped_relu2_limit_ptr,
     max_active_clusters: int,
     stream,
     # Dtype parameters (compile-time - IN cache key)
@@ -272,9 +273,6 @@ def _get_compiled_gather_kernel(
     situ_linear_beta: Optional[float] = None,
     gated: bool = True,
     use_a_per_token_scale: bool = False,
-    # ClampedRelu2 limit pointer (runtime parameter - NOT in cache key; the
-    # activation type above selects the clamped epilogue)
-    clamped_relu2_limit_ptr=None,
     # locality-domain half-GEMM (Rubin only, compile-time - IN cache key)
     localized_half_gemm: bool = False,
 ):
@@ -288,7 +286,7 @@ def _get_compiled_gather_kernel(
     """
     global _gather_kernel_cache
     normalized_activation_type, expected_gated = normalize_cute_dsl_moe_activation_type(
-        activation_type, allow_clamped_relu2=True
+        activation_type
     )
     if gated != expected_gated:
         raise ValueError(
@@ -639,7 +637,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
     assert a.device.type == "cuda", "Input tensors must be on CUDA device"
     assert b.device.type == "cuda", "Input tensors must be on CUDA device"
     normalized_activation_type, expected_gated = normalize_cute_dsl_moe_activation_type(
-        activation_type, allow_clamped_relu2=True
+        activation_type
     )
     if gated != expected_gated:
         raise ValueError(
@@ -649,15 +647,8 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
     validate_cute_dsl_moe_situ_config(
         normalized_activation_type, situ_beta, situ_linear_beta
     )
-    validate_cute_dsl_moe_clamped_relu2(
-        normalized_activation_type,
-        clamped_relu2_limit,
-        a.device,
-        swiglu_alpha=swiglu_alpha,
-        swiglu_beta=swiglu_beta,
-        swiglu_limit=swiglu_limit,
-        situ_beta=situ_beta,
-        situ_linear_beta=situ_linear_beta,
+    validate_cute_dsl_moe_clamped_relu2_config(
+        normalized_activation_type, clamped_relu2_limit, a.device
     )
 
     # Get dimensions
@@ -986,6 +977,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         num_tiles_ptr=num_tiles_ptr,
         norm_const_ptr=norm_const_ptr,
         a_per_token_scale_ptr=a_per_token_scale_ptr,
+        clamped_relu2_limit_ptr=clamped_relu2_limit_ptr,
         max_active_clusters=max_active_clusters,
         stream=stream,
         # Dtype parameters (compile-time, in cache key)
@@ -1013,7 +1005,6 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         situ_linear_beta=situ_linear_beta,
         gated=gated,
         use_a_per_token_scale=use_a_per_token_scale,
-        clamped_relu2_limit_ptr=clamped_relu2_limit_ptr,
         localized_half_gemm=localized_half_gemm,
     )
 

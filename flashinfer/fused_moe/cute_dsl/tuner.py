@@ -57,7 +57,7 @@ from .blackwell.moe_w4a16 import launch_w4a16_moe
 from .blackwell.moe_w4a16_kernel import Sm100W4A16GroupedGemmKernel
 from .moe_utils import (
     normalize_cute_dsl_moe_activation_type,
-    validate_cute_dsl_moe_clamped_relu2,
+    validate_cute_dsl_moe_clamped_relu2_config,
     validate_cute_dsl_moe_situ_config,
 )
 
@@ -526,18 +526,8 @@ class CuteDslFusedMoERunner(TunableRunner):
         localized_memset_stream: Optional[torch.cuda.Stream] = None,
         clamped_relu2_limit: Optional[torch.Tensor] = None,
     ):
-        activation_type, gated = normalize_cute_dsl_moe_activation_type(
-            activation_type, allow_clamped_relu2=True
-        )
-        validate_cute_dsl_moe_clamped_relu2(
-            activation_type,
-            clamped_relu2_limit,
-            swiglu_alpha=swiglu_alpha,
-            swiglu_beta=swiglu_beta,
-            swiglu_limit=swiglu_limit,
-            situ_beta=situ_beta,
-            situ_linear_beta=situ_linear_beta,
-        )
+        activation_type, gated = normalize_cute_dsl_moe_activation_type(activation_type)
+        validate_cute_dsl_moe_clamped_relu2_config(activation_type, clamped_relu2_limit)
         validate_cute_dsl_moe_situ_config(activation_type, situ_beta, situ_linear_beta)
         quant_mode = quant_mode.lower()
         if quant_mode not in ("w4a4", "w4a8", "mxfp8"):
@@ -1147,6 +1137,15 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
         situ_linear_beta: Optional[float] = None,
     ):
         activation_type, _ = normalize_cute_dsl_moe_activation_type(activation_type)
+        if activation_type not in (
+            ActivationType.Swiglu,
+            ActivationType.GegluTanh,
+            ActivationType.Relu2,
+        ):
+            raise ValueError(
+                f"Unsupported activation_type {activation_type!r} for W4A16; "
+                "expected Swiglu, GegluTanh or Relu2"
+            )
         validate_cute_dsl_moe_situ_config(activation_type, situ_beta, situ_linear_beta)
         if output_dtype != torch.bfloat16:
             raise ValueError("W4A16 only supports BF16 output")

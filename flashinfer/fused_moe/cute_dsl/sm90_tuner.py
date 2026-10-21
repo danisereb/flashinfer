@@ -205,6 +205,15 @@ class CuteDslFusedMoESm90Runner(TunableRunner):
         self.use_fused_finalize = use_fused_finalize
         self.enable_pdl = enable_pdl
         activation, self.gated = normalize_cute_dsl_moe_activation_type(activation_type)
+        if activation not in (
+            ActivationType.Swiglu,
+            ActivationType.GegluTanh,
+            ActivationType.Relu2,
+        ):
+            raise ValueError(
+                f"Unsupported activation_type {activation!r} for the SM90 CuTe-DSL MoE; "
+                "expected Swiglu, GegluTanh or Relu2"
+            )
         validate_cute_dsl_moe_swiglu_config(swiglu_alpha, swiglu_beta, swiglu_limit)
         validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
         self.activation_type = int(activation)
